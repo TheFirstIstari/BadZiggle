@@ -572,8 +572,8 @@ pub const VideoEncoder = struct {
         );
 
         const ret = c.avcodec_send_frame(self.ctx, self.frame);
-        self.frame.?.pts += 1;
         if (ret < 0) return error.EncodeSendFailed;
+        self.frame.?.pts += 1;
 
         while (true) {
             const recv_ret = c.avcodec_receive_packet(self.ctx, self.pkt);
