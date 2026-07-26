@@ -157,6 +157,10 @@ pub const VideoDecoder = struct {
             return error.CodecOpenFailed;
         }
 
+        // Enable slice-based multi-threaded decoding.
+        ctx[0].thread_count = @intCast(std.Thread.getCpuCount() catch 1);
+        ctx[0].thread_type = FF_THREAD_SLICE;
+
         const width: u32 = @intCast(ctx[0].width);
         const height: u32 = @intCast(ctx[0].height);
 
