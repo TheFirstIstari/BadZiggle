@@ -292,9 +292,16 @@ pub const VideoDecoder = struct {
         while (true) {
             // Read the next packet from the container.
             const read_ret = c.av_read_frame(self.fmt, self.pkt);
-            if (read_ret < 0) {
+            if (read_ret == AVERROR_EOF) {
                 self.eof = true;
                 return NextResult{ .end_of_stream = {} };
+            }
+            if (read_ret == AVERROR_EAGAIN) {
+                c.av_packet_unref(self.pkt);
+                continue;
+            }
+            if (read_ret < 0) {
+                return error.EncodeSendFailed;
             }
 
             // Skip non-video packets.
