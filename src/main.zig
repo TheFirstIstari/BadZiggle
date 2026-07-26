@@ -328,12 +328,15 @@ fn runRender(opts: types.Options, io: std.Io) !u8 {
         }
     }
 
+    const src_fps = render.readFpsFile(cli.g_allocator, manifest_dir, io);
+    const encoder_fps = if (src_fps > 0.0) src_fps else 30.0;
+
     var encoder = video.VideoEncoder.open(
         cli.g_allocator,
         output_z,
         width,
         height,
-        30.0, // fps will be overridden by timebase
+        encoder_fps,
         pix_fmt_name,
         codec_name,
     ) catch |err| {
