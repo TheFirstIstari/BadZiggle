@@ -124,7 +124,7 @@ pub const AtlasCache = struct {
         const h = hash(op_id, tw, th);
         var probe: usize = 0;
         while (probe < self.capacity) : (probe += 1) {
-            const idx = (h +% @as(u32, @intCast(probe))) % @as(u32, @intCast(self.capacity));
+            const idx = (h +% @as(u32, @intCast(probe))) & @as(u32, @intCast(self.capacity - 1));
             const e = &self.entries[idx];
             if (e.valid == 0) return null;
             if (e.valid == 2) continue;
@@ -182,7 +182,7 @@ pub const AtlasCache = struct {
         var tombstone_idx: ?usize = null;
         var probe: usize = 0;
         while (probe < self.capacity) : (probe += 1) {
-            const idx = (h +% @as(u32, @intCast(probe))) % @as(u32, @intCast(self.capacity));
+            const idx = (h +% @as(u32, @intCast(probe))) & @as(u32, @intCast(self.capacity - 1));
             const e = &self.entries[idx];
             if (e.valid == 0 or e.valid == 2) {
                 const use_idx = tombstone_idx orelse idx;
@@ -506,18 +506,12 @@ pub fn scanManifests(allocator: Allocator, dir_path: []const u8, io: std.Io) ![]
         try paths.append(allocator, full_path);
     }
 
-    // Sort by filename (frame order). Simple insertion sort.
-    const items = paths.items;
-    var i: usize = 1;
-    while (i < items.len) : (i += 1) {
-        const key = items[i];
-        var j = i;
-        while (j > 0 and std.mem.order(u8, items[j - 1], key) == .gt) {
-            items[j] = items[j - 1];
-            j -= 1;
+    // Sort by filename (frame order).
+    std.mem.sort([]const u8, paths.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
         }
-        items[j] = key;
-    }
+    }.lessThan);
 
     return try paths.toOwnedSlice(allocator);
 }
