@@ -34,13 +34,16 @@ fn fferrtag(a: u8, b: u8, c_val: u8, d: u8) c_int {
 }
 
 const AVERROR_EOF = fferrtag('E', 'O', 'F', ' ');
-const AVERROR_EAGAIN = fferrtag('E', 'A', 'G', 'A');
+// AVERROR(EAGAIN) = -(EAGAIN). EAGAIN is 35 on macOS, 11 on Linux.
+const builtin = @import("builtin");
+const AVERROR_EAGAIN: c_int = if (builtin.os.tag == .macos) -35 else -11;
 
 // ---------------------------------------------------------------------------
 // Error set
 // ---------------------------------------------------------------------------
 
 pub const VideoError = error{
+    OutOfMemory,
     FormatOpenFailed,
     StreamInfoFailed,
     NoVideoStream,
@@ -154,8 +157,8 @@ pub const VideoDecoder = struct {
             return error.CodecOpenFailed;
         }
 
-        const width: u32 = @intCast(ctx.?.width);
-        const height: u32 = @intCast(ctx.?.height);
+        const width: u32 = @intCast(ctx[0].width);
+        const height: u32 = @intCast(ctx[0].height);
 
         // FPS: prefer r_frame_rate (true codec timing) over avg_frame_rate
         const fps_val: f64 = blk: {
@@ -174,7 +177,7 @@ pub const VideoDecoder = struct {
         const sws = c.sws_getContext(
             @intCast(width),
             @intCast(height),
-            ctx.?.pix_fmt,
+            ctx[0].pix_fmt,
             @intCast(width),
             @intCast(height),
             c.AV_PIX_FMT_BGR24,
@@ -189,8 +192,8 @@ pub const VideoDecoder = struct {
         };
 
         // -- frame & packet --
-        const frame = c.av_frame_alloc();
-        const pkt = c.av_packet_alloc();
+        var frame = c.av_frame_alloc();
+        var pkt = c.av_packet_alloc();
         if (frame == null or pkt == null) {
             c.av_frame_free(&frame);
             c.av_packet_free(&pkt);
@@ -248,7 +251,7 @@ pub const VideoDecoder = struct {
             }
 
             // Send packet to decoder.
-            var send_ret = c.avcodec_send_packet(self.ctx, self.pkt);
+            const send_ret = c.avcodec_send_packet(self.ctx, self.pkt);
             c.av_packet_unref(self.pkt);
             if (send_ret < 0) continue;
 
@@ -259,7 +262,7 @@ pub const VideoDecoder = struct {
                 if (recv_ret < 0) return error.EncodeSendFailed;
 
                 // Got a frame — convert to BGR24.
-                var img = try Img.init(self.allocator, self.width, self.height, 3);
+                const img = try Img.init(self.allocator, self.width, self.height, 3);
 
                 var dst_slices: [1][*]u8 = .{img.pixels.ptr};
                 var dst_stride: [1]c_int = .{@intCast(img.stride)};
@@ -352,14 +355,14 @@ pub const VideoEncoder = struct {
             return error.CodecAllocFailed;
         };
 
-        ctx.?.width = @intCast(w);
-        ctx.?.height = @intCast(h);
-        ctx.?.pix_fmt = dst_pix_fmt;
+        ctx[0].width = @intCast(w);
+        ctx[0].height = @intCast(h);
+        ctx[0].pix_fmt = dst_pix_fmt;
         const fps_int: c_int = if (fps > 0) @intFromFloat(fps) else 30;
-        ctx.?.time_base = .{ .num = 1, .den = fps_int };
+        ctx[0].time_base = .{ .num = 1, .den = fps_int };
 
         if ((ofmt.?.flags & AVFMT_GLOBALHEADER) != 0)
-            ctx.?.flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            ctx[0].flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
         // Threading: hardware encoders handle it internally, software benefits from slice MT.
         const is_hw = blk: {
@@ -370,11 +373,11 @@ pub const VideoEncoder = struct {
                 std.mem.indexOf(u8, name_str, "amf") != null);
         };
         if (is_hw) {
-            _ = c.av_opt_set_double(ctx.?.priv_data, "q", 80.0, 0);
+            _ = c.av_opt_set_double(ctx[0].priv_data, "q", 80.0, 0);
         } else {
             const ncores = std.Thread.getCpuCount() catch 1;
-            ctx.?.thread_count = @intCast(ncores);
-            ctx.?.thread_type = FF_THREAD_SLICE;
+            ctx[0].thread_count = @intCast(ncores);
+            ctx[0].thread_type = FF_THREAD_SLICE;
         }
 
         if (c.avcodec_open2(ctx, codec, null) < 0) {
@@ -389,8 +392,8 @@ pub const VideoEncoder = struct {
             c.avformat_free_context(fmt_ctx);
             return error.StreamCreateFailed;
         };
-        _ = c.avcodec_parameters_from_context(stream.?.codecpar, ctx);
-        stream.?.time_base = ctx.?.time_base;
+        _ = c.avcodec_parameters_from_context(stream[0].codecpar, ctx);
+        stream[0].time_base = ctx[0].time_base;
 
         // -- open file for writing --
         if ((ofmt.?.flags & AVFMT_NOFILE) == 0) {
@@ -434,7 +437,7 @@ pub const VideoEncoder = struct {
             null,
         );
 
-        const frame = c.av_frame_alloc();
+        var frame = c.av_frame_alloc();
         if (sws_bgr == null or sws_gray == null or frame == null) {
             c.sws_freeContext(sws_bgr);
             c.sws_freeContext(sws_gray);
@@ -445,10 +448,10 @@ pub const VideoEncoder = struct {
             return error.SwsAllocFailed;
         }
 
-        frame.?.format = dst_pix_fmt;
-        frame.?.width = @intCast(w);
-        frame.?.height = @intCast(h);
-        frame.?.pts = 0;
+        frame[0].format = dst_pix_fmt;
+        frame[0].width = @intCast(w);
+        frame[0].height = @intCast(h);
+        frame[0].pts = 0;
 
         if (c.av_frame_get_buffer(frame, 0) < 0) {
             c.sws_freeContext(sws_bgr);
@@ -525,7 +528,7 @@ pub const VideoEncoder = struct {
 
         _ = c.av_write_trailer(self.fmt);
 
-        if ((self.fmt.?.oformat.?.flags & AVFMT_NOFILE) == 0)
+        if ((self.fmt.?.oformat[0].flags & AVFMT_NOFILE) == 0)
             _ = c.avio_closep(&self.fmt.?.pb);
 
         c.sws_freeContext(self.sws_bgr);
@@ -545,8 +548,6 @@ pub const VideoEncoder = struct {
 /// Returns the name of the best available HW encoder, or null if none found.
 /// Caller should fall back to software (e.g. "prores_ks") when null.
 pub fn probeHwEncoder() ?[*:0]const u8 {
-    const builtin = @import("builtin");
-
     if (builtin.os.tag == .macos) {
         if (c.avcodec_find_encoder_by_name("hevc_videotoolbox") != null) return "hevc_videotoolbox";
         if (c.avcodec_find_encoder_by_name("h264_videotoolbox") != null) return "h264_videotoolbox";
@@ -614,11 +615,11 @@ pub fn imageLoad(allocator: std.mem.Allocator, path: [*:0]const u8) VideoError!I
 
     // -- colourspace converter: native -> BGR24 --
     const sws = c.sws_getContext(
-        ctx.?.width,
-        ctx.?.height,
-        ctx.?.pix_fmt,
-        ctx.?.width,
-        ctx.?.height,
+        ctx[0].width,
+        ctx[0].height,
+        ctx[0].pix_fmt,
+        ctx[0].width,
+        ctx[0].height,
         c.AV_PIX_FMT_BGR24,
         SWS_BILINEAR,
         null,
@@ -631,8 +632,8 @@ pub fn imageLoad(allocator: std.mem.Allocator, path: [*:0]const u8) VideoError!I
     };
 
     // -- frame & packet --
-    const frame = c.av_frame_alloc();
-    const pkt = c.av_packet_alloc();
+    var frame = c.av_frame_alloc();
+    var pkt = c.av_packet_alloc();
     if (frame == null or pkt == null) {
         c.av_frame_free(&frame);
         c.av_packet_free(&pkt);
@@ -645,7 +646,7 @@ pub fn imageLoad(allocator: std.mem.Allocator, path: [*:0]const u8) VideoError!I
     // Read packets until we decode the first frame.
     var got_frame = false;
     while (c.av_read_frame(fmt, pkt) >= 0) {
-        if (pkt.?.stream_index != video_stream) {
+        if (pkt[0].stream_index != video_stream) {
             c.av_packet_unref(pkt);
             continue;
         }
@@ -669,9 +670,9 @@ pub fn imageLoad(allocator: std.mem.Allocator, path: [*:0]const u8) VideoError!I
     var result: VideoError!Img = error.FormatOpenFailed;
 
     if (got_frame) {
-        const w: u32 = @intCast(ctx.?.width);
-        const h: u32 = @intCast(ctx.?.height);
-        var img = Img.init(allocator, w, h, 3) catch {
+        const w: u32 = @intCast(ctx[0].width);
+        const h: u32 = @intCast(ctx[0].height);
+        const img = Img.init(allocator, w, h, 3) catch {
             c.av_frame_free(&frame);
             c.av_packet_free(&pkt);
             c.sws_freeContext(sws);
@@ -685,10 +686,10 @@ pub fn imageLoad(allocator: std.mem.Allocator, path: [*:0]const u8) VideoError!I
 
         _ = c.sws_scale(
             sws,
-            @ptrCast(&frame.?.data),
-            @ptrCast(&frame.?.linesize),
+            @ptrCast(&frame[0].data),
+            @ptrCast(&frame[0].linesize),
             0,
-            @intCast(frame.?.height),
+            @intCast(frame[0].height),
             @ptrCast(&dst_slices),
             @ptrCast(&dst_stride),
         );

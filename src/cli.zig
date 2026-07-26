@@ -262,18 +262,20 @@ pub fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     if (!needs_escape) return input;
 
     var result = std.ArrayList(u8).initCapacity(allocator, input.len + 2) catch return error.OutOfMemory;
-    defer result.deinit();
+    defer result.deinit(allocator);
     for (input) |c| {
         if (c == '\\' or c == '"') {
-            try result.append('\\');
-            try result.append(c);
+            try result.append(allocator, '\\');
+            try result.append(allocator, c);
         } else if (c < 0x20) {
-            try result.writer().print("\\u{0:0>4}", .{c});
+            var unicode_buf: [16]u8 = undefined;
+            const unicode_str = std.fmt.bufPrint(&unicode_buf, "\\u{x:0>4}", .{c}) catch continue;
+            try result.appendSlice(allocator, unicode_str);
         } else {
-            try result.append(c);
+            try result.append(allocator, c);
         }
     }
-    return result.toOwnedSlice();
+    return result.toOwnedSlice(allocator);
 }
 
 pub fn jsonStart() void {

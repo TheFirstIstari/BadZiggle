@@ -88,6 +88,157 @@ pub const SystemConfig = struct {
     cache_enabled: bool,
 };
 
+// ---------------------------------------------------------------------------
+// FeatureDB / Registry binary loaders
+// ---------------------------------------------------------------------------
+
+pub const LoadError = error{
+    FileOpenFailed,
+    FileReadFailed,
+    InvalidHeader,
+    InvalidData,
+    OutOfMemory,
+};
+
+/// Load a features.bin file.
+///
+/// Binary format (little-endian):
+///   [0..4]   u32 n_pages
+///   [4..8]   u32 feat_len
+///   [8..12]  u32 G (bits per cell, 1–8)
+///   [12..16] u32 n_scales
+///   [16..]   n_scales × u32 scale values
+///   [..]     u32 has_edges
+///   [..]     u32 channels (optional, present when feat_len implies color)
+///   [..]     n_pages × feat_len bytes of feature data
+pub fn loadFeatures(allocator: std.mem.Allocator, path: []const u8, io: std.Io) LoadError!FeatureDB {
+    const buf = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 40)) catch return error.FileReadFailed;
+    defer allocator.free(buf);
+
+    if (buf.len < 24) return error.InvalidHeader;
+
+    const n_pages = std.mem.readInt(u32, buf[0..4], .little);
+    const feat_len = std.mem.readInt(u32, buf[4..8], .little);
+    const G = std.mem.readInt(u32, buf[8..12], .little);
+    const n_scales = std.mem.readInt(u32, buf[12..16], .little);
+
+    if (G == 0 or G > 8 or n_scales == 0 or n_scales > 16) return error.InvalidHeader;
+
+    const header_len: usize = 16 + @as(usize, n_scales) * 4 + 4;
+    if (buf.len < header_len) return error.InvalidHeader;
+
+    // Read scale array.
+    const scales = try allocator.alloc(u32, n_scales);
+    errdefer allocator.free(scales);
+    for (0..n_scales) |i| {
+        const s = std.mem.readInt(u32, buf[16 + i * 4 ..][0..4], .little);
+        if (s == 0 or s > 256) {
+            allocator.free(scales);
+            return error.InvalidData;
+        }
+        scales[i] = s;
+    }
+
+    const has_edges_val = std.mem.readInt(u32, buf[16 + n_scales * 4 ..][0..4], .little) != 0;
+
+    // Detect channels from feat_len.
+    var gray_feat_len: usize = 0;
+    for (scales) |s| {
+        gray_feat_len += @as(usize, s) * s;
+    }
+    const expected_gray = gray_feat_len * (if (has_edges_val) @as(usize, 2) else @as(usize, 1));
+    const expected_color = gray_feat_len * (1 + (if (has_edges_val) @as(usize, 1) else @as(usize, 0)) + 3);
+
+    var detected_channels: u32 = 0;
+    var data_offset = header_len;
+    if (feat_len == expected_gray) {
+        detected_channels = 1;
+    } else if (feat_len == expected_color) {
+        detected_channels = 3;
+        // Try to read the channels field from header if present.
+        if (buf.len >= header_len + 4) {
+            const ch = std.mem.readInt(u32, buf[header_len..][0..4], .little);
+            if (ch == 3) data_offset = header_len + 4;
+        }
+    } else {
+        allocator.free(scales);
+        return error.InvalidData;
+    }
+
+    const data_len = @as(usize, n_pages) * @as(usize, feat_len);
+    if (data_offset + data_len > buf.len) {
+        allocator.free(scales);
+        return error.InvalidData;
+    }
+
+    const data = try allocator.alloc(u8, data_len);
+    errdefer allocator.free(data);
+    @memcpy(data, buf[data_offset..][0..data_len]);
+
+    return FeatureDB{
+        .n_pages = n_pages,
+        .feat_len = feat_len,
+        .G = G,
+        .n_scales = n_scales,
+        .scales = scales,
+        .has_edges = has_edges_val,
+        .channels = detected_channels,
+        .data = data,
+        .allocator = allocator,
+    };
+}
+
+/// Load a registry.bin file.
+///
+/// Binary format (little-endian):
+///   [0..4]   u32 n (number of entries)
+///   per entry:
+///     [..]     i32 page_idx
+///     [..]     u32 path_len
+///     [..]     path_len bytes of UTF-8 path
+pub fn loadRegistry(allocator: std.mem.Allocator, path: []const u8, io: std.Io) LoadError!Registry {
+    const buf = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 40)) catch return error.FileReadFailed;
+    defer allocator.free(buf);
+
+    if (buf.len < 4) return error.InvalidHeader;
+
+    const n = std.mem.readInt(u32, buf[0..4], .little);
+    if (n > buf.len / 5) return error.InvalidData;
+
+    const entries = try allocator.alloc(RegEntry, n);
+    errdefer {
+        for (entries) |e| allocator.free(e.pdf_path);
+        allocator.free(entries);
+    }
+
+    var off: usize = 4;
+    for (0..n) |i| {
+        if (off + 8 > buf.len) return error.InvalidData;
+
+        const page_idx = std.mem.readInt(i32, buf[off..][0..4], .little);
+        off += 4;
+        const plen = std.mem.readInt(u32, buf[off..][0..4], .little);
+        off += 4;
+
+        if (off + plen > buf.len) return error.InvalidData;
+
+        const p = try allocator.alloc(u8, plen);
+        errdefer allocator.free(p);
+        @memcpy(p, buf[off..][0..plen]);
+        off += plen;
+
+        entries[i] = .{
+            .page_idx = page_idx,
+            .pdf_path = p,
+        };
+    }
+
+    return Registry{
+        .entries = entries,
+        .allocator = allocator,
+    };
+}
+
 /// CLI options
 pub const Options = struct {
     input: []const u8 = "",

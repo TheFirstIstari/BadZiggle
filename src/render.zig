@@ -263,13 +263,14 @@ pub const EncodePipeline = struct {
     enc_width: u32,
     enc_height: u32,
     enc_channels: u32,
-    mutex: std.Thread.Mutex,
-    can_write: std.Thread.Condition,
-    can_read: std.Thread.Condition,
+    mutex: std.Io.Mutex,
+    can_write: std.Io.Condition,
+    can_read: std.Io.Condition,
     done: bool,
     frames_written: u64,
     video_encoder: ?*VideoEncoderRef,
     allocator: Allocator,
+    io: std.Io,
 
     /// Opaque reference to a video encoder — the caller provides write/deinit.
     pub const VideoEncoderRef = struct {
@@ -283,6 +284,7 @@ pub const EncodePipeline = struct {
         width: u32,
         height: u32,
         channels: u32,
+        io: std.Io,
     ) !EncodePipeline {
         var self = EncodePipeline{
             .slots = [_]FrameSlot{.{}} ** FRAME_QUEUE_SIZE,
@@ -292,13 +294,14 @@ pub const EncodePipeline = struct {
             .enc_width = width,
             .enc_height = height,
             .enc_channels = channels,
-            .mutex = .{},
-            .can_write = .{},
-            .can_read = .{},
+            .mutex = std.Io.Mutex.init,
+            .can_write = std.Io.Condition.init,
+            .can_read = std.Io.Condition.init,
             .done = false,
             .frames_written = 0,
             .video_encoder = enc_ref,
             .allocator = allocator,
+            .io = io,
         };
 
         const canvas_bytes = @as(usize, width) * @as(usize, height) * @as(usize, channels);
@@ -318,13 +321,13 @@ pub const EncodePipeline = struct {
         }
     }
 
-    pub fn push(self: *EncodePipeline, canvas: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn push(self: *EncodePipeline, canvas: []const u8) !void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
 
         // Wait until a slot is available.
         while (self.count >= FRAME_QUEUE_SIZE) {
-            self.can_write.wait(&self.mutex);
+            try self.can_write.wait(self.io, &self.mutex);
         }
 
         const slot = &self.slots[self.write_idx];
@@ -332,44 +335,44 @@ pub const EncodePipeline = struct {
         slot.filled = true;
         self.write_idx = (self.write_idx + 1) % FRAME_QUEUE_SIZE;
         self.count +|= 1;
-        self.can_read.signal();
+        self.can_read.signal(self.io);
     }
 
-    pub fn close(self: *EncodePipeline) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn close(self: *EncodePipeline) !void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         self.done = true;
-        self.can_read.broadcast();
+        self.can_read.broadcast(self.io);
     }
 
     /// Blocking: drain remaining frames and wait for the encoder thread to finish.
     /// The encoder thread proc is `encoderThreadFn`.
     pub fn encoderThreadFn(self: *EncodePipeline) void {
         while (true) {
-            self.mutex.lock();
+            self.mutex.lock(self.io) catch return;
 
             while (self.count == 0 and !self.done) {
-                self.can_read.wait(&self.mutex);
+                self.can_read.wait(self.io, &self.mutex) catch return;
             }
             if (self.count == 0 and self.done) {
-                self.mutex.unlock();
+                self.mutex.unlock(self.io);
                 break;
             }
 
             const slot = &self.slots[self.read_idx];
             self.read_idx = (self.read_idx + 1) % FRAME_QUEUE_SIZE;
             self.count -= 1;
-            self.can_write.signal();
-            self.mutex.unlock();
+            self.can_write.signal(self.io);
+            self.mutex.unlock(self.io);
 
             // Encode outside the lock.
             if (self.video_encoder) |enc| {
                 enc.write_fn(enc.ctx, slot.pixels, self.enc_width, self.enc_height, self.enc_channels);
             }
 
-            self.mutex.lock();
+            self.mutex.lock(self.io) catch return;
             self.frames_written +|= 1;
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
         }
     }
 };
@@ -468,8 +471,9 @@ pub fn loadManifestFile(
     path: []const u8,
     target_w: i32,
     target_h: i32,
+    io: std.Io,
 ) !LoadedManifest {
-    const data = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024 * 16);
+    const data = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024 * 16));
     defer allocator.free(data);
     return loadManifest(allocator, data, target_w, target_h);
 }
@@ -477,18 +481,18 @@ pub fn loadManifestFile(
 // ── Manifest directory scanning ────────────────────────────────────────────────
 
 /// Scan a directory for .bin manifest files and return sorted paths.
-pub fn scanManifests(allocator: Allocator, dir_path: []const u8) ![][]const u8 {
-    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
-    defer dir.close();
+pub fn scanManifests(allocator: Allocator, dir_path: []const u8, io: std.Io) ![][]const u8 {
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
 
-    var paths = std.ArrayList([]const u8).init(allocator);
+    var paths: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (paths.items) |p| allocator.free(p);
-        paths.deinit();
+        paths.deinit(allocator);
     }
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
         const name = entry.name;
         if (name.len < 5) continue; // minimum: "a.bin"
@@ -499,7 +503,7 @@ pub fn scanManifests(allocator: Allocator, dir_path: []const u8) ![][]const u8 {
         if (std.mem.eql(u8, name, "fps.bin")) continue;
 
         const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, name });
-        try paths.append(full_path);
+        try paths.append(allocator, full_path);
     }
 
     // Sort by filename (frame order). Simple insertion sort.
@@ -515,7 +519,7 @@ pub fn scanManifests(allocator: Allocator, dir_path: []const u8) ![][]const u8 {
         items[j] = key;
     }
 
-    return try paths.toOwnedSlice();
+    return try paths.toOwnedSlice(allocator);
 }
 
 // ── Solid fill ─────────────────────────────────────────────────────────────────
@@ -708,15 +712,15 @@ pub const FrameAssembly = struct {
 // ── FPS detection ──────────────────────────────────────────────────────────────
 
 /// Read fps from a sidecar fps.bin file. Returns 0.0 if not found or invalid.
-pub fn readFpsFile(allocator: Allocator, dir_path: []const u8) f64 {
+pub fn readFpsFile(allocator: Allocator, dir_path: []const u8, io: std.Io) f64 {
     const path = std.fmt.allocPrint(allocator, "{s}/fps.bin", .{dir_path}) catch return 0.0;
     defer allocator.free(path);
 
-    const data = std.fs.cwd().readFileAlloc(allocator, path, 1024) catch return 0.0;
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024)) catch return 0.0;
     defer allocator.free(data);
 
     if (data.len < @sizeOf(f64)) return 0.0;
-    return std.mem.readInt(f64, data[0..@sizeOf(f64)], .little);
+    return @bitCast(std.mem.readInt(u64, data[0..@sizeOf(f64)], .little));
 }
 
 // ── Main render entry point ───────────────────────────────────────────────────
@@ -761,13 +765,14 @@ pub fn render(
     opts: RenderOptions,
     source_renderer: ?*SourceRenderer,
     encoder: ?*EncodePipeline.VideoEncoderRef,
+    io: std.Io,
 ) !RenderSummary {
     const width: u32 = if (opts.width > 0) @intCast(opts.width) else 7680;
     const height: u32 = if (opts.height > 0) @intCast(opts.height) else 4320;
     const channels = if (opts.channels == 1 or opts.channels == 3) opts.channels else @as(u32, 1);
 
     // ── Scan manifests ──────────────────────────────────────────────
-    const manifest_paths = scanManifests(allocator, opts.manifest_dir) catch {
+    const manifest_paths = scanManifests(allocator, opts.manifest_dir, io) catch {
         cli.err("cannot open manifests dir: {s}", .{opts.manifest_dir});
         return error.FileOpenFailed;
     };
@@ -785,7 +790,7 @@ pub fn render(
 
     // ── Auto-detect fps from sidecar ────────────────────────────────
     var fps = opts.fps;
-    const src_fps = readFpsFile(allocator, opts.manifest_dir);
+    const src_fps = readFpsFile(allocator, opts.manifest_dir, io);
     if (fps <= 0.0 and src_fps > 0.0) {
         fps = src_fps;
         cli.info("auto-detected fps: {d:.2} (from source video)", .{fps});
@@ -808,9 +813,9 @@ pub fn render(
 
     var loaded_count: u32 = 0;
     for (manifest_paths, 0..) |path, i| {
-        loaded[i] = loadManifestFile(allocator, path, @intCast(width), @intCast(height)) catch {
+        loaded[i] = loadManifestFile(allocator, path, @intCast(width), @intCast(height), io) catch blk: {
             cli.warn("skip bad manifest: {s}", .{path});
-            LoadedManifest{ .insts = &.{}, .n = 0 };
+            break :blk LoadedManifest{ .insts = &.{}, .n = 0 };
         };
         if (loaded[i].n > 0) loaded_count +|= 1;
     }
@@ -833,7 +838,7 @@ pub fn render(
     }
 
     // ── Encode pipeline ─────────────────────────────────────────────
-    var pipeline = try EncodePipeline.init(allocator, encoder, width, height, channels);
+    var pipeline = try EncodePipeline.init(allocator, encoder, width, height, channels, io);
     defer pipeline.deinit();
 
     // Start encoder thread.
@@ -841,7 +846,7 @@ pub fn render(
 
     // ── Process frames ──────────────────────────────────────────────
     var frames_done: u32 = 0;
-    const start_time = std.time.nanoTimestamp();
+    const start_time = std.Io.Clock.now(.awake, io).nanoseconds;
 
     for (0..max_frames_actual) |fi| {
         const insts = loaded[fi].insts;
@@ -850,12 +855,12 @@ pub fn render(
         assembleFrame(canvas, insts, &atlas, source_renderer, width, height, channels);
 
         // Push to encode pipeline.
-        pipeline.push(canvas);
+        try pipeline.push(canvas);
         frames_done +|= 1;
 
         // Progress reporting.
         if (!cli.ctx().quiet and frames_done % 30 == 0) {
-            const now = std.time.nanoTimestamp();
+            const now = std.Io.Clock.now(.awake, io).nanoseconds;
             const elapsed = @as(f64, @floatFromInt(now - start_time)) / 1_000_000_000.0;
             const fps_out = @as(f64, @floatFromInt(frames_done)) / @max(elapsed, 0.001);
             const cache_pct = if (atlas.hits + atlas.misses > 0)
@@ -867,11 +872,11 @@ pub fn render(
     }
 
     // ── Flush and join ──────────────────────────────────────────────
-    pipeline.close();
+    try pipeline.close();
     enc_thread.join();
 
     // ── Cleanup ─────────────────────────────────────────────────────
-    const end_time = std.time.nanoTimestamp();
+    const end_time = std.Io.Clock.now(.awake, io).nanoseconds;
     const total_secs = @as(f64, @floatFromInt(end_time - start_time)) / 1_000_000_000.0;
     const out_fps = @as(f64, @floatFromInt(frames_done)) / @max(total_secs, 0.001);
     const cache_lookups = atlas.hits + atlas.misses;

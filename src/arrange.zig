@@ -178,7 +178,7 @@ const SolveBuffers = struct {
         if (self.visited) |v| allocator.free(v);
         if (self.coarse_hit) |ch| allocator.free(ch);
         if (self.miss_idx) |mi| allocator.free(mi);
-        if (self.specs) |*sp| sp.deinit();
+        if (self.specs) |*sp| sp.deinit(allocator);
     }
 };
 
@@ -255,7 +255,7 @@ pub const Arranger = struct {
             .max_block = max_block,
             .hero_min = hero_min,
             .bufs = SolveBuffers{},
-            .miss_idx = std.ArrayList(usize).init(allocator),
+            .miss_idx = .empty,
             .coarse_cache = Cache.init(allocator),
             .full_cache = Cache.init(allocator),
         };
@@ -263,7 +263,7 @@ pub const Arranger = struct {
 
     pub fn deinit(self: *Arranger) void {
         self.bufs.deinit(self.allocator);
-        self.miss_idx.deinit();
+        self.miss_idx.deinit(self.allocator);
         self.coarse_cache.deinit();
         self.full_cache.deinit();
     }
@@ -324,7 +324,7 @@ pub const Arranger = struct {
 
         // Ensure specs list.
         if (self.bufs.specs == null) {
-            self.bufs.specs = std.ArrayList(TileSpec).init(self.allocator);
+            self.bufs.specs = .empty;
         }
         var specs = self.bufs.specs.?;
         specs.clearRetainingCapacity();
@@ -409,7 +409,7 @@ pub const Arranger = struct {
 
                 if (mw >= self.hero_min and mh >= self.hero_min) {
                     // Hero block: pure white or black, no matching needed.
-                    try manifest.append(.{
+                    try manifest.append(self.allocator, .{
                         .x = @intCast(x),
                         .y = @intCast(yy),
                         .w = @intCast(mw),
@@ -420,14 +420,14 @@ pub const Arranger = struct {
                     n += 1;
                 } else {
                     // Non-hero: record spec for feature extraction.
-                    try specs.append(.{
+                    try specs.append(self.allocator, .{
                         .x = @intCast(x),
                         .y = @intCast(yy),
                         .w = @intCast(mw),
                         .h = @intCast(mh),
                         .manifest_idx = n,
                     });
-                    try manifest.append(.{
+                    try manifest.append(self.allocator, .{
                         .x = @intCast(x),
                         .y = @intCast(yy),
                         .w = @intCast(mw),
@@ -455,7 +455,7 @@ pub const Arranger = struct {
         color_pixels: []const u8,
         color_stride: u32,
         w: u32,
-        h: u32,
+        _: u32,
         db: *const FeatureDB,
         reg: *const Registry,
         specs: *std.ArrayList(TileSpec),
@@ -596,9 +596,9 @@ pub const Arranger = struct {
                 manifest.items[midx].op_id = pid;
                 manifest.items[midx].page_idx = reg.entries[@intCast(pid)].page_idx;
             } else {
-                try self.miss_idx.append(i);
+                try self.miss_idx.append(self.allocator, i);
                 // Copy feature into tiles buffer for batch matching.
-                try tiles_buf.appendSlice(feat);
+                try tiles_buf.appendSlice(self.allocator, feat);
             }
         }
 
@@ -651,14 +651,14 @@ pub const Arranger = struct {
         reg: *const Registry,
         t: *Timings,
     ) !std.ArrayList(Inst) {
-        var manifest = std.ArrayList(Inst).init(self.allocator);
-        errdefer manifest.deinit();
+        var manifest: std.ArrayList(Inst) = .empty;
+        errdefer manifest.deinit(self.allocator);
 
-        var tiles_buf = std.ArrayList(u8).init(self.allocator);
-        defer tiles_buf.deinit();
+        var tiles_buf: std.ArrayList(u8) = .empty;
+        defer tiles_buf.deinit(self.allocator);
 
         var specs = try self.solveGreedy(gray, w, h, &manifest);
-        defer specs.deinit();
+        defer specs.deinit(self.allocator);
 
         try self.extractAndMatch(
             gray,
@@ -718,9 +718,10 @@ pub fn writeManifest(
     src_w: u32,
     src_h: u32,
     manifest: []const Inst,
+    io: std.Io,
 ) !void {
     // Ensure output directory exists.
-    std.fs.cwd().makeDir(dir) catch |err| {
+    std.Io.Dir.cwd().createDir(io, dir, .default_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
 
@@ -728,43 +729,46 @@ pub fn writeManifest(
     var buf: [256]u8 = undefined;
     const name = std.fmt.bufPrint(&buf, "{s}/{:0>4}.bin", .{ dir, frame_idx }) catch return error.NameTooLong;
 
-    const file = try std.fs.cwd().createFile(name, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, name, .{});
+    defer file.close(io);
 
-    var bw = std.io.bufferedWriter(file.writer());
-    const writer = bw.writer();
+    var write_buf: [4096]u8 = undefined;
+    var fw = file.writer(io, &write_buf);
 
     // Header: src_w, src_h, n
-    try writer.writeInt(u32, src_w, .little);
-    try writer.writeInt(u32, src_h, .little);
-    try writer.writeInt(u32, @intCast(manifest.len), .little);
+    try fw.interface.writeAll(std.mem.asBytes(&std.mem.nativeToLittle(u32, src_w)));
+    try fw.interface.writeAll(std.mem.asBytes(&std.mem.nativeToLittle(u32, src_h)));
+    try fw.interface.writeAll(std.mem.asBytes(&std.mem.nativeToLittle(u32, @intCast(manifest.len))));
 
     // Records
     for (manifest) |inst| {
-        try writer.writeInt(i32, inst.x, .little);
-        try writer.writeInt(i32, inst.y, .little);
-        try writer.writeInt(i32, inst.w, .little);
-        try writer.writeInt(i32, inst.h, .little);
-        try writer.writeInt(i32, inst.op_id, .little);
-        try writer.writeInt(i32, inst.page_idx, .little);
+        try fw.interface.writeAll(std.mem.asBytes(&std.mem.nativeToLittle(i32, inst.x)));
+        try fw.interface.writeAll(std.mem.asBytes(&std.mem.nativeToLittle(i32, inst.y)));
+        try fw.interface.writeAll(std.mem.asBytes(&std.mem.nativeToLittle(i32, inst.w)));
+        try fw.interface.writeAll(std.mem.asBytes(&std.mem.nativeToLittle(i32, inst.h)));
+        try fw.interface.writeAll(std.mem.asBytes(&std.mem.nativeToLittle(i32, inst.op_id)));
+        try fw.interface.writeAll(std.mem.asBytes(&std.mem.nativeToLittle(i32, inst.page_idx)));
     }
 
-    try bw.flush();
+    try fw.interface.flush();
 }
 
 /// Write the fps sidecar file so the renderer can auto-detect source frame rate.
-pub fn writeFpsSidecar(dir: []const u8, fps: f64) !void {
-    std.fs.cwd().makeDir(dir) catch |err| {
+pub fn writeFpsSidecar(dir: []const u8, fps: f64, io: std.Io) !void {
+    std.Io.Dir.cwd().createDir(io, dir, .default_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
 
     var buf: [256]u8 = undefined;
     const name = std.fmt.bufPrint(&buf, "{s}/fps.bin", .{dir}) catch return error.NameTooLong;
 
-    const file = try std.fs.cwd().createFile(name, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, name, .{});
+    defer file.close(io);
 
-    try file.writer().writeAll(std.mem.asBytes(&fps));
+    var write_buf: [4096]u8 = undefined;
+    var fw = file.writer(io, &write_buf);
+    try fw.interface.writeAll(std.mem.asBytes(&fps));
+    try fw.interface.flush();
 }
 
 // ---------------------------------------------------------------------------
@@ -848,22 +852,21 @@ test "Cache: clear resets state" {
 }
 
 test "writeManifest: creates file" {
-    const allocator = std.testing.allocator;
     const manifest = [_]Inst{
         .{ .x = 0, .y = 0, .w = 64, .h = 64, .op_id = -2, .page_idx = -1 },
         .{ .x = 64, .y = 0, .w = 32, .h = 32, .op_id = 5, .page_idx = 10 },
     };
 
-    try writeManifest("/tmp/badziggle_test", 0, 1920, 1080, &manifest);
+    try writeManifest("/tmp/badziggle_test", 0, 1920, 1080, &manifest, std.testing.io);
 
     // Verify file exists and has correct size.
     // Header (12 bytes) + 2 records × 24 bytes = 60 bytes.
-    const file = try std.fs.cwd().openFile("/tmp/badziggle_test/0000.bin", .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(std.testing.io, "/tmp/badziggle_test/0000.bin", .{});
+    defer file.close(std.testing.io);
     const stat = try file.stat();
     try std.testing.expectEqual(@as(u64, 60), stat.size);
 
     // Clean up.
-    std.fs.cwd().deleteFile("/tmp/badziggle_test/0000.bin") catch {};
-    std.fs.cwd().deleteDir("/tmp/badziggle_test") catch {};
+    std.Io.Dir.cwd().deleteFile(std.testing.io, "/tmp/badziggle_test/0000.bin") catch {};
+    std.Io.Dir.cwd().deleteDir(std.testing.io, "/tmp/badziggle_test") catch {};
 }
