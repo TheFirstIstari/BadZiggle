@@ -116,7 +116,7 @@ const TopKList = struct {
     }
 
     /// Get the best (smallest distance) entry
-    fn best(self: *const TopKEntry) TopKEntry {
+    fn best(self: *const TopKList) TopKEntry {
         return .{
             .distance = self.distances[0],
             .index = self.indices[0],
