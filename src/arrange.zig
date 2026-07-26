@@ -482,15 +482,22 @@ pub const Arranger = struct {
         const coarse_hit = self.bufs.coarse_hit.?;
         for (coarse_hit) |*ch| ch.* = -1;
 
+        // Pre-allocate reusable buffers to avoid per-tile allocation in the hot loop.
+        const N: u32 = self.scales[0];
+        const coarse_feat_len: usize = @as(usize, N) * N;
+        var coarse_feat = try self.allocator.alloc(u8, coarse_feat_len);
+        defer self.allocator.free(coarse_feat);
+
+        const max_crop_len: usize = @as(usize, self.max_block) * @as(usize, self.max_block) * @as(usize, db.channels);
+        var crop_buf = try self.allocator.alloc(u8, max_crop_len);
+        defer self.allocator.free(crop_buf);
+
         // Extract coarse features and check coarse cache.
         for (specs.items, 0..) |*sp, i| {
             const sp_w: u32 = @intCast(sp.w);
             const sp_h: u32 = @intCast(sp.h);
 
-            // Build a crop buffer for this tile.
-            const crop_len: usize = @as(usize, sp_w) * sp_h * db.channels;
-            var crop_buf = try self.allocator.alloc(u8, crop_len);
-            defer self.allocator.free(crop_buf);
+            // Build a crop buffer for this tile using the pre-allocated buffer.
 
             if (db.channels == 3) {
                 for (0..@as(usize, @intCast(sp.h))) |row| {
@@ -509,10 +516,6 @@ pub const Arranger = struct {
             }
 
             // Compute coarse feature: area-resample to scales[0] × scales[0].
-            const N: u32 = self.scales[0];
-            var coarse_feat = try self.allocator.alloc(u8, @as(usize, N) * N);
-            defer self.allocator.free(coarse_feat);
-
             const sw = sp_w;
             const sh = sp_h;
             const maxv: u32 = (@as(u32, 1) << @intCast(self.G)) - 1;
