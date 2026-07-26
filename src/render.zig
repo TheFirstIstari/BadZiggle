@@ -157,6 +157,25 @@ pub const AtlasCache = struct {
         }
     }
 
+    /// Copy tile pixel rows from src to dst.
+    fn copyTilePixels(
+        dst: []u8,
+        src_pixels: []const u8,
+        tw: u32,
+        th: u32,
+        src_channels: u32,
+        src_stride: u32,
+    ) void {
+        const row_bytes = @as(usize, tw) * src_channels;
+        for (0..@as(usize, th)) |y| {
+            const src_off = @as(usize, y) * src_stride;
+            const dst_off = @as(usize, y) * (tw * src_channels);
+            const copy_len = @min(row_bytes, src_pixels.len -| src_off);
+            const dst_len = dst.len -| dst_off;
+            @memcpy(dst[dst_off..][0..@min(copy_len, dst_len)], src_pixels[src_off..][0..@min(copy_len, dst_len)]);
+        }
+    }
+
     /// Insert a tile into the atlas cache.
     /// Copies the pixel data from src.
     pub fn insert(
@@ -196,14 +215,7 @@ pub const AtlasCache = struct {
                 const new_pixels = self.allocator.alloc(u8, tw * th * src_channels) catch return;
                 self.entries[use_idx].pixels = new_pixels;
 
-                const row_bytes = @as(usize, tw) * src_channels;
-                for (0..@as(usize, th)) |y| {
-                    const src_off = @as(usize, y) * src_stride;
-                    const dst_off = @as(usize, y) * (tw * src_channels);
-                    const copy_len = @min(row_bytes, src_pixels.len -| src_off);
-                    const dst_len = new_pixels.len -| dst_off;
-                    @memcpy(new_pixels[dst_off..][0..@min(copy_len, dst_len)], src_pixels[src_off..][0..@min(copy_len, dst_len)]);
-                }
+                copyTilePixels(new_pixels, src_pixels, tw, th, src_channels, src_stride);
 
                 self.entries[use_idx].bytes = entry_bytes;
                 self.entries[use_idx].valid = 1;
@@ -229,14 +241,7 @@ pub const AtlasCache = struct {
             const new_pixels = self.allocator.alloc(u8, tw * th * src_channels) catch return;
             self.entries[use_idx].pixels = new_pixels;
 
-            const row_bytes = @as(usize, tw) * src_channels;
-            for (0..@as(usize, th)) |y| {
-                const src_off = @as(usize, y) * src_stride;
-                const dst_off = @as(usize, y) * (tw * src_channels);
-                const copy_len = @min(row_bytes, src_pixels.len -| src_off);
-                const dst_len = new_pixels.len -| dst_off;
-                @memcpy(new_pixels[dst_off..][0..@min(copy_len, dst_len)], src_pixels[src_off..][0..@min(copy_len, dst_len)]);
-            }
+            copyTilePixels(new_pixels, src_pixels, tw, th, src_channels, src_stride);
 
             self.entries[use_idx].bytes = entry_bytes;
             self.entries[use_idx].valid = 1;
