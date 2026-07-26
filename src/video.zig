@@ -87,8 +87,39 @@ fn ensureNetworkInit() void {
 }
 
 // =========================================================================
-//  VideoDecoder
+//  Frame pool — pre-allocated Img slots to avoid per-frame malloc
+//  in the decode hot loop. Pool frames use a pool allocator whose
+//  free() is a no-op, so the caller's Img.deinit() preserves pool buffers.
 // =========================================================================
+
+fn poolAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+    const allocator: *std.mem.Allocator = @ptrCast(@alignCast(ctx));
+    return allocator.rawAlloc(len, alignment, ret_addr);
+}
+fn poolResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+    const allocator: *std.mem.Allocator = @ptrCast(@alignCast(ctx));
+    return allocator.rawResize(memory, alignment, new_len, ret_addr);
+}
+fn poolRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+    const allocator: *std.mem.Allocator = @ptrCast(@alignCast(ctx));
+    _ = alignment;
+    _ = ret_addr;
+    if (new_len == 0) {
+        allocator.free(memory);
+        return memory[0..0];
+    }
+    return null;
+}
+fn poolFree(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize) void {}
+
+const pool_vtable = std.mem.Allocator.VTable{
+    .alloc = poolAlloc,
+    .resize = poolResize,
+    .remap = poolRemap,
+    .free = poolFree,
+};
+
+const POOL_SIZE: usize = 4;
 
 pub const VideoDecoder = struct {
     allocator: std.mem.Allocator,
@@ -103,6 +134,8 @@ pub const VideoDecoder = struct {
     height: u32,
     fps: f64,
     eof: bool,
+    pool_index: usize = 0,
+    pool_frames: [POOL_SIZE]Img,
 
     /// Open `path` for decoding. Caller must call `deinit` when done.
     pub fn open(allocator: std.mem.Allocator, path: [*:0]const u8) VideoError!VideoDecoder {
@@ -207,6 +240,20 @@ pub const VideoDecoder = struct {
             return error.FrameAllocFailed;
         }
 
+        // Pre-allocate frame pool to avoid per-frame malloc in decode loop.
+        var pool_frames: [POOL_SIZE]Img = undefined;
+        var j: usize = 0;
+        while (j < POOL_SIZE) : (j += 1) {
+            pool_frames[j] = Img.init(allocator, width, height, 3) catch {
+                c.av_frame_free(&frame);
+                c.av_packet_free(&pkt);
+                c.sws_freeContext(sws);
+                c.avcodec_free_context(&ctx);
+                c.avformat_close_input(&fmt);
+                return error.FrameAllocFailed;
+            };
+        }
+
         return VideoDecoder{
             .allocator = allocator,
             .fmt = fmt,
@@ -220,6 +267,8 @@ pub const VideoDecoder = struct {
             .height = height,
             .fps = fps_val,
             .eof = false,
+            .pool_index = 0,
+            .pool_frames = pool_frames,
         };
     }
 
@@ -265,8 +314,14 @@ pub const VideoDecoder = struct {
                 if (recv_ret == AVERROR_EAGAIN or recv_ret == AVERROR_EOF) break;
                 if (recv_ret < 0) return error.EncodeSendFailed;
 
-                // Got a frame — convert to BGR24.
-                const img = try Img.init(self.allocator, self.width, self.height, 3);
+                // Got a frame — convert to BGR24 using the frame pool.
+                const pool_idx = self.pool_index;
+                self.pool_index = (self.pool_index + 1) % POOL_SIZE;
+                var img = self.pool_frames[pool_idx];
+                img.allocator = .{
+                    .ptr = &self.allocator,
+                    .vtable = &pool_vtable,
+                };
 
                 var dst_slices: [1][*]u8 = .{img.pixels.ptr};
                 var dst_stride: [1]c_int = .{@intCast(img.stride)};
@@ -288,6 +343,14 @@ pub const VideoDecoder = struct {
     }
 
     pub fn deinit(self: *VideoDecoder) void {
+        // Free pool frame pixel buffers.
+        var i: usize = 0;
+        while (i < POOL_SIZE) : (i += 1) {
+            if (self.pool_frames[i].pixels.len > 0) {
+                self.allocator.free(self.pool_frames[i].pixels);
+                self.pool_frames[i].pixels = &.{};
+            }
+        }
         c.sws_freeContext(self.sws);
         c.av_frame_free(&self.frame);
         c.av_packet_free(&self.pkt);
