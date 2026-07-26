@@ -663,6 +663,9 @@ pub const Arranger = struct {
         var specs = try self.solveGreedy(gray, w, h, &manifest);
         defer specs.deinit(self.allocator);
 
+        // Pre-size tiles_buf to avoid reallocations during miss collection.
+        try tiles_buf.ensureTotalCapacityPrecise(self.allocator, specs.items.len * db.feat_len);
+
         try self.extractAndMatch(
             gray,
             color_pixels,
