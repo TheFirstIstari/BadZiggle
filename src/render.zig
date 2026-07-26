@@ -525,15 +525,16 @@ pub fn scanManifests(allocator: Allocator, dir_path: []const u8, io: std.Io) ![]
 
 /// Fill a solid-color rectangle on the canvas.
 /// op_id == -2 → white (255), op_id == -1 → black (0).
-fn blitSolid(canvas: []u8, inst: *const Inst, width: u32, channels: u32) void {
+fn blitSolid(canvas: []u8, inst: *const Inst, width: u32, height: u32, channels: u32) void {
     const val: u8 = if (inst.op_id == -2) 255 else 0;
     const sx0 = inst.x;
     const sy0 = inst.y;
     const width_i: i32 = @intCast(width);
+    const height_i: i32 = @intCast(height);
 
     for (0..@as(usize, @intCast(inst.h))) |yy| {
         const dst_y = sy0 + @as(i32, @intCast(yy));
-        if (dst_y < 0 or dst_y >= width_i) continue;
+        if (dst_y < 0 or dst_y >= height_i) continue;
 
         var fill_x: i32 = sx0;
         var fill_w: i32 = inst.w;
@@ -582,6 +583,7 @@ fn blitTile(
     tile_channels: u32,
     inst: *const Inst,
     canvas_w: u32,
+    canvas_h: u32,
     canvas_channels: u32,
 ) void {
     const sx0 = inst.x;
@@ -589,10 +591,11 @@ fn blitTile(
     const dw = inst.w;
     const dh = inst.h;
     const canvas_w_i: i32 = @intCast(canvas_w);
+    const canvas_h_i: i32 = @intCast(canvas_h);
 
     for (0..@as(usize, @intCast(dh))) |yy| {
         const dst_y = sy0 + @as(i32, @intCast(yy));
-        if (dst_y < 0 or dst_y >= canvas_w_i) continue;
+        if (dst_y < 0 or dst_y >= canvas_h_i) continue;
 
         var copy_x: i32 = sx0;
         var copy_src_x: i32 = 0;
@@ -647,7 +650,7 @@ pub fn assembleFrame(
     for (insts) |*inst| {
         // Solid fill instructions.
         if (inst.op_id < 0) {
-            blitSolid(canvas, inst, width, channels);
+            blitSolid(canvas, inst, width, height, channels);
             continue;
         }
 
@@ -688,7 +691,7 @@ pub fn assembleFrame(
             }
         }
 
-        blitTile(canvas, tile_pixels, tile_stride, tile_channels, inst, width, channels);
+        blitTile(canvas, tile_pixels, tile_stride, tile_channels, inst, width, height, channels);
 
         if (need_free) {
             // We need to free via the same allocator that created the Img.
@@ -961,7 +964,7 @@ test "blitSolid: fills canvas" {
     @memset(&canvas, 0);
 
     const inst = Inst{ .x = 0, .y = 0, .w = 4, .h = 2, .op_id = -2, .page_idx = 0 };
-    blitSolid(&canvas, &inst, 4, 1);
+    blitSolid(&canvas, &inst, 4, 12, 1);
 
     // Should be all 255 (white) for the first 8 pixels.
     for (0..8) |i| {
@@ -983,7 +986,7 @@ test "blitTile: copies tile to canvas" {
     tile[3] = 40;
 
     const inst = Inst{ .x = 2, .y = 0, .w = 2, .h = 2, .op_id = 0, .page_idx = 0 };
-    blitTile(canvas, tile, 2, 1, &inst, 4, 1);
+    blitTile(canvas, tile, 2, 1, &inst, 4, 4, 1);
 
     // Row 0: pixels at x=2,3 should be 10,20
     try std.testing.expectEqual(@as(u8, 10), canvas[2]);
