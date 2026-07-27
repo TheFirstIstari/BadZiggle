@@ -15,6 +15,7 @@ const Inst = @import("types.zig").Inst;
 const Registry = @import("types.zig").Registry;
 const cli = @import("cli.zig");
 const imgops = @import("imgops.zig");
+const video = @import("video.zig");
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -464,6 +465,13 @@ pub fn loadManifest(
             if (insts[i].y + insts[i].h > target_h) insts[i].h = target_h - insts[i].y;
         } else {
             insts[i] = Inst{ .x = bx, .y = by, .w = bw, .h = bh, .op_id = op_id, .page_idx = page_idx };
+            // Clamp to canvas bounds even at 1:1 scale.
+            if (insts[i].x < 0) insts[i].x = 0;
+            if (insts[i].y < 0) insts[i].y = 0;
+            if (insts[i].w < 0) insts[i].w = 0;
+            if (insts[i].h < 0) insts[i].h = 0;
+            if (insts[i].x + insts[i].w > target_w) insts[i].w = target_w - insts[i].x;
+            if (insts[i].y + insts[i].h > target_h) insts[i].h = target_h - insts[i].y;
         }
     }
 
@@ -526,6 +534,7 @@ pub fn scanManifests(allocator: Allocator, dir_path: []const u8, io: std.Io) ![]
 /// Fill a solid-color rectangle on the canvas.
 /// op_id == -2 → white (255), op_id == -1 → black (0).
 fn blitSolid(canvas: []u8, inst: *const Inst, width: u32, height: u32, channels: u32) void {
+    if (inst.w <= 0 or inst.h <= 0) return;
     const val: u8 = if (inst.op_id == -2) 255 else 0;
     const sx0 = inst.x;
     const sy0 = inst.y;
@@ -586,6 +595,7 @@ fn blitTile(
     canvas_h: u32,
     canvas_channels: u32,
 ) void {
+    if (inst.w <= 0 or inst.h <= 0) return;
     const sx0 = inst.x;
     const sy0 = inst.y;
     const dw = inst.w;
@@ -629,6 +639,68 @@ pub const SourceRenderer = struct {
     ctx: *anyopaque,
 };
 
+/// Concrete source renderer that loads images from the library.
+/// Uses FFmpeg to decode image files and scales to tile dimensions.
+pub const ImageSourceRenderer = struct {
+    registry: *const Registry,
+    allocator: Allocator,
+
+    pub fn init(registry: *const Registry, allocator: Allocator) ImageSourceRenderer {
+        return .{
+            .registry = registry,
+            .allocator = allocator,
+        };
+    }
+
+    /// Render a source page to an Img at the specified dimensions.
+    /// Returns null if the page cannot be loaded.
+    pub fn renderPage(self: *ImageSourceRenderer, op_id: i32, w: u32, h: u32, channels: u32) ?Img {
+        // Look up the registry entry.
+        if (op_id < 0 or @as(usize, @intCast(op_id)) >= self.registry.entries.len) {
+            return null;
+        }
+
+        const entry = self.registry.entries[@as(usize, @intCast(op_id))];
+        const pdf_path = entry.pdf_path;
+
+        // Create null-terminated path for FFmpeg.
+        const path_z = self.allocator.dupeZ(u8, pdf_path) catch return null;
+        defer self.allocator.free(path_z);
+
+        // Load the image via FFmpeg.
+        var img = video.imageLoad(self.allocator, path_z) catch return null;
+        defer img.deinit();
+
+        // If we need grayscale and the image is BGR, convert.
+        if (channels == 1 and img.channels == 3) {
+            var gray = imgops.toGray(&img) catch return null;
+            defer gray.deinit();
+
+            // Scale to target dimensions.
+            const scaled = imgops.resizeArea(&gray, w, h) catch return null;
+            return scaled;
+        }
+
+        // Scale to target dimensions (keep BGR if channels == 3).
+        const scaled = imgops.resizeArea(&img, w, h) catch return null;
+        return scaled;
+    }
+
+    /// Callback function compatible with SourceRenderer.render_fn.
+    pub fn renderCallback(ctx: *anyopaque, op_id: i32, w: u32, h: u32, channels: u32) ?Img {
+        const self: *ImageSourceRenderer = @ptrCast(@alignCast(ctx));
+        return self.renderPage(op_id, w, h, channels);
+    }
+
+    /// Create a SourceRenderer from this instance.
+    pub fn toSourceRenderer(self: *ImageSourceRenderer) SourceRenderer {
+        return .{
+            .render_fn = renderCallback,
+            .ctx = @ptrCast(self),
+        };
+    }
+};
+
 /// Assemble a single frame onto the canvas from a list of instructions.
 ///
 /// For each instruction:
@@ -666,6 +738,7 @@ pub fn assembleFrame(
         var tile_stride: u32 = undefined;
         var tile_channels: u32 = undefined;
         var need_free = false;
+        var loaded_img: ?Img = null;
 
         if (cached) |entry| {
             // Cache hit.
@@ -676,6 +749,7 @@ pub fn assembleFrame(
             // Cache miss — render and scale on the fly.
             if (renderer) |r| {
                 if (r.render_fn(r.ctx, inst.op_id, dw, dh, channels)) |img| {
+                    loaded_img = img;
                     tile_pixels = img.pixels;
                     tile_stride = img.stride;
                     tile_channels = img.channels;
@@ -693,14 +767,11 @@ pub fn assembleFrame(
 
         blitTile(canvas, tile_pixels, tile_stride, tile_channels, inst, width, height, channels);
 
+        // Free the temporary image if we loaded it.
         if (need_free) {
-            // We need to free via the same allocator that created the Img.
-            // Since we don't have the allocator here, the caller must handle this.
-            // For the cache insert path, the atlas copied the data, so we can free here.
-            // But we need the allocator. For now, the caller is responsible.
-            // The renderer should return an Img whose allocator matches what we expect.
-            // In practice, the SourceRenderer.render_fn should use the allocator
-            // that will be passed to the cleanup callback.
+            if (loaded_img) |*img| {
+                img.deinit();
+            }
         }
     }
 }

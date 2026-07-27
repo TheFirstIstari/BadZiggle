@@ -17,6 +17,79 @@ pub fn getThreads() u32 {
     return g_match_threads;
 }
 
+// ── Thread context structs ──────────────────────────────────────────
+
+const CoarseCtx = struct {
+    lib: []const u8,
+    targets: []const u8,
+    top_k: []TopKList,
+    n_pages: u32,
+    num_targets: u32,
+    feat_len: u32,
+    actual_coarse_len: u32,
+    start_target: u32,
+    end_target: u32,
+};
+
+const FineCtx = struct {
+    lib: []const u8,
+    targets: []const u8,
+    top_k: []const TopKList,
+    results: []i32,
+    num_targets: u32,
+    feat_len: u32,
+    start_target: u32,
+    end_target: u32,
+};
+
+// ── Thread workers ──────────────────────────────────────────────────
+
+fn processCoarseChunk(ctx: *const CoarseCtx) void {
+    var target_idx = ctx.start_target;
+    while (target_idx < ctx.end_target) : (target_idx += 1) {
+        const target_offset = @as(usize, target_idx) * ctx.feat_len;
+        const target = ctx.targets[target_offset..][0..ctx.feat_len];
+
+        var page_idx: u32 = 0;
+        while (page_idx < ctx.n_pages) : (page_idx += 1) {
+            const page_offset = @as(usize, page_idx) * ctx.feat_len;
+            const page = ctx.lib[page_offset..][0..ctx.feat_len];
+
+            const d = featureL1(page[0..ctx.actual_coarse_len], target[0..ctx.actual_coarse_len]);
+            ctx.top_k[target_idx].insert(d, @intCast(page_idx));
+        }
+    }
+}
+
+fn processFineChunk(ctx: *const FineCtx) void {
+    var target_idx = ctx.start_target;
+    while (target_idx < ctx.end_target) : (target_idx += 1) {
+        var best_d: u32 = std.math.maxInt(u32);
+        var best_i: i32 = -1;
+
+        const target_offset = @as(usize, target_idx) * ctx.feat_len;
+        const target = ctx.targets[target_offset..][0..ctx.feat_len];
+
+        for (ctx.top_k[target_idx].indices, ctx.top_k[target_idx].distances) |candidate_idx, _| {
+            if (candidate_idx < 0) break;
+
+            const candidate_offset = @as(usize, @intCast(candidate_idx)) * ctx.feat_len;
+            const candidate = ctx.lib[candidate_offset..][0..ctx.feat_len];
+
+            const d = featureL1Bounded(candidate, target, best_d);
+            if (d < best_d) {
+                best_d = d;
+                best_i = candidate_idx;
+            }
+        }
+
+        if (best_i == -1) {
+            best_i = ctx.top_k[target_idx].indices[0];
+        }
+        ctx.results[target_idx] = best_i;
+    }
+}
+
 // ── Scalar L1 distance ─────────────────────────────────────────────────────
 
 /// Compute L1 (sum of absolute differences) distance between two feature vectors.
@@ -188,53 +261,120 @@ pub fn matchBatchCoarse(
         tk.* = TopKList.init();
     }
 
-    // Iterate over all pages and targets for coarse matching
-    var page_idx: u32 = 0;
-    while (page_idx < n_pages) : (page_idx += 1) {
-        const page_offset = @as(usize, page_idx) * feat_len;
-        const page = lib[page_offset..][0..feat_len];
+    // ── Threading setup ──
+    const num_threads = if (g_match_threads > 0) g_match_threads else @max(1, std.Thread.getCpuCount() catch 1);
+    const use_threads = num_threads > 1 and num_targets > num_threads;
+    const chunk_size = if (use_threads) (num_targets + num_threads - 1) / num_threads else 0;
 
-        var target_idx: u32 = 0;
-        while (target_idx < num_targets) : (target_idx += 1) {
-            const target_offset = @as(usize, target_idx) * feat_len;
-            const target = targets[target_offset..][0..feat_len];
+    // ── Coarse stage: parallel over target chunks ──
+    if (use_threads) {
+        var handles = try allocator.alloc(std.Thread, num_threads);
+        defer {
+            var t: u32 = 0;
+            while (t < num_threads) : (t += 1) {
+                handles[t].join();
+            }
+            allocator.free(handles);
+        }
 
-            // Compute coarse distance using only first coarse_len bytes
-            const d = featureL1(page[0..actual_coarse_len], target[0..actual_coarse_len]);
+        var t: u32 = 0;
+        while (t < num_threads) : (t += 1) {
+            const start: u32 = @intCast(t * chunk_size);
+            const end: u32 = @intCast(@min(start + chunk_size, num_targets));
+            if (start >= num_targets) break;
 
-            top_k[target_idx].insert(d, @intCast(page_idx));
+            const ctx = try allocator.create(CoarseCtx);
+            ctx.* = .{
+                .lib = lib,
+                .targets = targets,
+                .top_k = top_k,
+                .n_pages = n_pages,
+                .num_targets = num_targets,
+                .feat_len = feat_len,
+                .actual_coarse_len = actual_coarse_len,
+                .start_target = start,
+                .end_target = end,
+            };
+
+            handles[t] = try std.Thread.spawn(.{}, processCoarseChunk, .{ctx});
+        }
+    } else {
+        var page_idx: u32 = 0;
+        while (page_idx < n_pages) : (page_idx += 1) {
+            const page_offset = @as(usize, page_idx) * feat_len;
+            const page = lib[page_offset..][0..feat_len];
+
+            var target_idx: u32 = 0;
+            while (target_idx < num_targets) : (target_idx += 1) {
+                const target_offset = @as(usize, target_idx) * feat_len;
+                const target = targets[target_offset..][0..feat_len];
+
+                const d = featureL1(page[0..actual_coarse_len], target[0..actual_coarse_len]);
+
+                top_k[target_idx].insert(d, @intCast(page_idx));
+            }
         }
     }
 
-    // Fine stage: full-feature L1 against top-K candidates
+    // ── Fine stage: parallel over target chunks ──
     if (fine_needed) {
-        var target_idx: u32 = 0;
-        while (target_idx < num_targets) : (target_idx += 1) {
-            var best_d: u32 = std.math.maxInt(u32);
-            var best_i: i32 = -1;
-
-            const target_offset = @as(usize, target_idx) * feat_len;
-            const target = targets[target_offset..][0..feat_len];
-
-            // Iterate through K candidates
-            for (top_k[target_idx].indices, top_k[target_idx].distances) |candidate_idx, _| {
-                if (candidate_idx < 0) break;
-
-                const candidate_offset = @as(usize, @intCast(candidate_idx)) * feat_len;
-                const candidate = lib[candidate_offset..][0..feat_len];
-
-                const d = featureL1Bounded(candidate, target, best_d);
-                if (d < best_d) {
-                    best_d = d;
-                    best_i = candidate_idx;
+        if (use_threads) {
+            var handles = try allocator.alloc(std.Thread, num_threads);
+            defer {
+                var t: u32 = 0;
+                while (t < num_threads) : (t += 1) {
+                    handles[t].join();
                 }
+                allocator.free(handles);
             }
 
-            // Fallback to best coarse candidate if fine stage didn't find anything
-            if (best_i == -1) {
-                best_i = top_k[target_idx].indices[0];
+            var t: u32 = 0;
+            while (t < num_threads) : (t += 1) {
+                const start: u32 = @intCast(t * chunk_size);
+                const end: u32 = @intCast(@min(start + chunk_size, num_targets));
+                if (start >= num_targets) break;
+
+                const ctx = try allocator.create(FineCtx);
+                ctx.* = .{
+                    .lib = lib,
+                    .targets = targets,
+                    .top_k = top_k,
+                    .results = results,
+                    .num_targets = num_targets,
+                    .feat_len = feat_len,
+                    .start_target = start,
+                    .end_target = end,
+                };
+
+                handles[t] = try std.Thread.spawn(.{}, processFineChunk, .{ctx});
             }
-            results[target_idx] = best_i;
+        } else {
+            var target_idx: u32 = 0;
+            while (target_idx < num_targets) : (target_idx += 1) {
+                var best_d: u32 = std.math.maxInt(u32);
+                var best_i: i32 = -1;
+
+                const target_offset = @as(usize, target_idx) * feat_len;
+                const target = targets[target_offset..][0..feat_len];
+
+                for (top_k[target_idx].indices, top_k[target_idx].distances) |candidate_idx, _| {
+                    if (candidate_idx < 0) break;
+
+                    const candidate_offset = @as(usize, @intCast(candidate_idx)) * feat_len;
+                    const candidate = lib[candidate_offset..][0..feat_len];
+
+                    const d = featureL1Bounded(candidate, target, best_d);
+                    if (d < best_d) {
+                        best_d = d;
+                        best_i = candidate_idx;
+                    }
+                }
+
+                if (best_i == -1) {
+                    best_i = top_k[target_idx].indices[0];
+                }
+                results[target_idx] = best_i;
+            }
         }
     } else {
         // Coarse stage already used the full feature vector

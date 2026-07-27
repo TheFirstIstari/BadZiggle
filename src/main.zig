@@ -3,10 +3,20 @@ const cli = @import("cli.zig");
 const types = @import("types.zig");
 const video = @import("video.zig");
 const arrange = @import("arrange.zig");
+const match = @import("match.zig");
 const render = @import("render.zig");
 const imgops = @import("imgops.zig");
 
 const VERSION = "0.1.0";
+
+fn nowNanos() u64 {
+    var ts: std.c.timespec = undefined;
+    const ok = std.c.clock_gettime(std.c.clockid_t.MONOTONIC, &ts);
+    if (ok != 0) {
+        return 0;
+    }
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
 
 fn printHelp() void {
     cli.info("badziggle v{s} — tiled video encoder using PDF/image library matching", .{VERSION});
@@ -200,6 +210,9 @@ fn runArrange(opts: *types.Options, io: std.Io) !u8 {
     var arranger = arrange.Arranger.init(cli.g_allocator, &db, fw, fh, max_block_pct, hero_min_pct);
     defer arranger.deinit();
 
+    // Wire thread count to matcher.
+    match.setThreads(cli.ctx().threads);
+
     // Ensure output directory exists.
     std.Io.Dir.cwd().createDir(io, opts.manifests, .default_dir) catch |err| {
         if (err != error.PathAlreadyExists) {
@@ -217,7 +230,9 @@ fn runArrange(opts: *types.Options, io: std.Io) !u8 {
     // Decode and process frames.
     var frame_idx: u32 = 0;
     var timings = arrange.Timings{};
-    const total_estimate: u32 = @intFromFloat(source_fps * 300.0);
+    // Use max_frames as total estimate if set, otherwise 0 (unknown).
+    const total_estimate: u32 = if (opts.max_frames > 0) opts.max_frames else 0;
+    const start_time = nowNanos();
 
     while (true) {
         if (opts.max_frames > 0 and frame_idx >= opts.max_frames) break;
@@ -264,13 +279,30 @@ fn runArrange(opts: *types.Options, io: std.Io) !u8 {
 
                 frame_idx +|= 1;
 
-                // Progress reporting.
-                cli.progressFrame("arrange", frame_idx, total_estimate, 0, 0);
+                // Progress reporting with timing and cache stats.
+                const now = nowNanos();
+                const elapsed = @as(f64, @floatFromInt(now - start_time)) / 1_000_000_000.0;
+                const fps = @as(f64, @floatFromInt(frame_idx)) / @max(elapsed, 0.001);
+                const detail = timings.tiles + timings.hits;
+                const cache_pct = if (detail > 0) @as(f64, @floatFromInt(timings.hits)) / @as(f64, @floatFromInt(detail)) * 100.0 else 0.0;
+                cli.progressFrame("arrange", frame_idx, total_estimate, fps, cache_pct);
             },
         }
     }
 
-    cli.progressDone("arrange complete");
+    // Arrange summary.
+    {
+        const end_time = nowNanos();
+        const elapsed = @as(f64, @floatFromInt(end_time - start_time)) / 1_000_000_000.0;
+        const fps = @as(f64, @floatFromInt(frame_idx)) / @max(elapsed, 0.001);
+        const detail = timings.tiles + timings.hits;
+        const cache_pct = if (detail > 0) @as(f64, @floatFromInt(timings.hits)) / @as(f64, @floatFromInt(detail)) * 100.0 else 0.0;
+        var buf: [256]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "arrange complete in {d:.2}s | {d:.1} fps | {d} frames | cache {d:.1}% | {d} tiles", .{
+            elapsed, fps, frame_idx, cache_pct, detail,
+        }) catch "arrange complete";
+        cli.progressDone(summary);
+    }
     cli.info("wrote {d} manifests to {s}", .{ frame_idx, opts.manifests });
     return 0;
 }
@@ -281,7 +313,11 @@ fn runRender(opts: types.Options, io: std.Io) !u8 {
 
     const manifest_dir = if (opts.manifests.len > 0) opts.manifests else "manifests_greedy";
     const output = if (opts.output.len > 0) opts.output else "output.mov";
-    const registry_path = if (opts.registry.len > 0) opts.registry else "registry.bin";
+
+    // Resolve library path so registry/features resolve correctly.
+    var lib_opts = opts;
+    resolveLibraryPath(&lib_opts);
+    const registry_path = resolveFilePath(lib_opts.library, opts.registry, "registry.bin");
 
     cli.info("manifests: {s}", .{manifest_dir});
     cli.info("output: {s}", .{output});
@@ -371,8 +407,19 @@ fn runRender(opts: types.Options, io: std.Io) !u8 {
         .ctx = @ptrCast(&ctx),
     };
 
-    // Run the render pipeline (no source renderer — tiles will be solid fills).
-    _ = render.render(cli.g_allocator, render_opts, null, &enc_ref, io) catch |err| {
+    // Load the registry for source image lookup.
+    var reg = types.loadRegistry(cli.g_allocator, registry_path, io) catch |err| {
+        cli.err("cannot load registry: {s} ({})", .{ registry_path, err });
+        return 1;
+    };
+    defer reg.deinit();
+
+    // Create source renderer for loading library images.
+    var source_renderer = render.ImageSourceRenderer.init(&reg, cli.g_allocator);
+    var source_ref = source_renderer.toSourceRenderer();
+
+    // Run the render pipeline with source renderer.
+    _ = render.render(cli.g_allocator, render_opts, &source_ref, &enc_ref, io) catch |err| {
         cli.err("render failed: {}", .{err});
         return 1;
     };
@@ -709,32 +756,53 @@ pub fn main(init: std.process.Init) u8 {
     }
 
     // Shorthand: <input> <output> [options] — auto-detect as arrange+render pipeline
-    if (args.len >= 4) {
-        // Check if args[2] doesn't start with '-' (it's a positional output arg)
-        const input_arg = args[2];
-        const output_arg = args[3];
-        if (input_arg.len > 0 and input_arg[0] != '-' and output_arg.len > 0 and output_arg[0] != '-') {
-            cli.info("badziggle shorthand encode: {s} -> {s}", .{ input_arg, output_arg });
+    // If cmd is not a known subcommand and doesn't start with '-', treat first two
+    // positional args as input/output (matches C badapplestein behavior).
+    if (cmd.len > 0 and cmd[0] != '-') {
+        // Find the next positional arg after cmd (skip any --flags and their values)
+        var output_arg: []const u8 = "";
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (arg.len >= 2 and arg[0] == '-') {
+                // Skip flag and its value if opt_needs_value
+                if (arg.len >= 3 and arg[1] == '-') {
+                    // --key or --key=val — skip value for known options that need one
+                    const key = arg[2..];
+                    if (std.mem.eql(u8, key, "library") or std.mem.eql(u8, key, "features") or
+                        std.mem.eql(u8, key, "registry") or std.mem.eql(u8, key, "manifests") or
+                        std.mem.eql(u8, key, "preset") or std.mem.eql(u8, key, "width") or
+                        std.mem.eql(u8, key, "height") or std.mem.eql(u8, key, "fps") or
+                        std.mem.eql(u8, key, "codec") or std.mem.eql(u8, key, "max-frames") or
+                        std.mem.eql(u8, key, "threads") or std.mem.eql(u8, key, "max-block-pct") or
+                        std.mem.eql(u8, key, "hero-min-pct") or std.mem.eql(u8, key, "out"))
+                    {
+                        // Check for --key=value form (no separate value arg needed)
+                        if (std.mem.indexOfScalar(u8, key, '=') == null) i += 1;
+                    }
+                }
+                continue;
+            }
+            // Found a positional arg — this is the output
+            output_arg = arg;
+            break;
+        }
+
+        if (output_arg.len > 0) {
+            cli.info("badziggle shorthand encode: {s} -> {s}", .{ cmd, output_arg });
 
             var opts = cli.buildOptions();
-            opts.video = input_arg;
+            opts.video = cmd;
             opts.output = output_arg;
             resolveLibraryPath(&opts);
 
             // Create a temp manifests directory in the output's parent.
             const output_dir = std.fs.path.dirname(output_arg) orelse ".";
-            var tmp_buf: [256]u8 = undefined;
-            const tmp_name = std.fmt.bufPrint(&tmp_buf, "{s}/.badziggle-manifests-XXXXXX", .{output_dir}) catch {
-                cli.err("cannot create temp manifest path", .{});
-                return 1;
-            };
-            // Use a deterministic temp name for now.
             const manifests_dir = std.fmt.allocPrint(cli.g_allocator, "{s}/.badziggle-manifests", .{output_dir}) catch {
                 cli.err("out of memory", .{});
                 return 1;
             };
             defer cli.g_allocator.free(manifests_dir);
-            _ = tmp_name;
 
             // Stage 1: Arrange.
             opts.manifests = manifests_dir;
