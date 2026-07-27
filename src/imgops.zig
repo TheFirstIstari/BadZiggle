@@ -142,23 +142,33 @@ pub fn integral(gray: []const u8, w: u32, h: u32, allocator: Allocator) ![]i64 {
 /// gray: input grayscale buffer (w*h bytes, row-major).
 /// out: pre-allocated output buffer (w*h bytes).
 /// Border pixels are filled from nearest interior pixel.
+///
+/// Uses pointer-based inner loops for better auto-vectorization
+/// by the compiler compared to index-based iteration.
 pub fn sobelMagnitude(gray: []const u8, w: u32, h: u32, out: []u8) void {
     // Interior pixels.
     for (1..h - 1) |y| {
+        const row_out = out[y * w ..];
         const row_top = gray[(y - 1) * w ..];
         const row_mid = gray[y * w ..];
         const row_bot = gray[(y + 1) * w ..];
-        const row_out = out[y * w ..];
 
-        for (1..w - 1) |x| {
-            const tl: i32 = row_top[x - 1];
-            const tc: i32 = row_top[x];
-            const tr: i32 = row_top[x + 1];
-            const ml: i32 = row_mid[x - 1];
-            const mr: i32 = row_mid[x + 1];
-            const bl: i32 = row_bot[x - 1];
-            const bc: i32 = row_bot[x];
-            const br: i32 = row_bot[x + 1];
+        // Pointers into each row for the inner loop.
+        const top = row_top.ptr;
+        const mid = row_mid.ptr;
+        const bot = row_bot.ptr;
+        const dst = row_out.ptr;
+
+        var x: usize = 1;
+        while (x < w - 1) : (x += 1) {
+            const tl: i32 = top[x - 1];
+            const tc: i32 = top[x];
+            const tr: i32 = top[x + 1];
+            const ml: i32 = mid[x - 1];
+            const mr: i32 = mid[x + 1];
+            const bl: i32 = bot[x - 1];
+            const bc: i32 = bot[x];
+            const br: i32 = bot[x + 1];
 
             const gx = -tl + tr - 2 * ml + 2 * mr - bl + br;
             const gy = -tl - 2 * tc - tr + bl + 2 * bc + br;
@@ -166,7 +176,7 @@ pub fn sobelMagnitude(gray: []const u8, w: u32, h: u32, out: []u8) void {
             const ax: u32 = @intCast(@abs(gx));
             const ay: u32 = @intCast(@abs(gy));
             const mag: u32 = if (ax >= ay) ax + ay / 2 else ay + ax / 2;
-            row_out[x] = @intCast(@min(mag, 255));
+            dst[x] = @intCast(@min(mag, 255));
         }
     }
 
