@@ -332,6 +332,7 @@ fn runRender(opts: types.Options, io: std.Io) !u8 {
         .fps = 0.0, // auto-detect from fps sidecar
         .max_frames = opts.max_frames,
         .channels = opts.channels,
+        .num_threads = opts.threads,
     };
 
     // Open the video encoder.
