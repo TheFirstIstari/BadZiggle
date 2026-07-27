@@ -52,12 +52,16 @@
 **After:** TBD
 **Verified:** `zig build` succeeds
 
-## Optimization 5: Optimize Cache Clearing in arrange.zig
-
-**Date:** 2026-07-26
-**File:** `arrange.zig`
-**Change:** Replaced `@memset(slots, CacheSlot{})` with byte-level zeroing using `@memset` on the raw bytes of the slot array, avoiding struct initialization overhead.
-**Rationale:** Cache clearing is called frequently; byte-level memset is more efficient than struct-by-struct initialization.
 **Before:** TBD
 **After:** TBD
 **Verified:** `zig build` succeeds
+
+## Optimization 6: Dynamic Hash Table Resizing for AtlasCache (atlas-hash)
+
+**Date:** 2026-07-27
+**File:** `render.zig`
+**Change:** Added `resize()` method to `AtlasCache` that doubles capacity and rehashes all valid entries when the table reaches 75% load factor. Added resize trigger check at the start of `insert()`. Tombstone entries (valid == 2) are dropped during rehashing.
+**Rationale:** The C reference (BadAppleStein `render.c`) dynamically resizes the atlas hash table when `count >= capacity * 3 / 4`, doubling capacity and rehashing all valid entries. Without resizing, the fixed 256-capacity table causes increasingly long probe sequences as entries accumulate, degrading lookup performance from O(1) to O(n). The resize maintains amortized O(1) lookups and inserts while keeping memory overhead reasonable. During rehashing, tombstone slots are naturally dropped (only valid == 1 entries are rehashed).
+**Before:** Fixed 256-entry hash table; O(n) probe sequences at high load
+**After:** Dynamic resizing maintains ~50-75% load factor for O(1) amortized operations
+**Verified:** `zig build`, `zig build test`, and `./zig-out/bin/badziggle --help` all succeed
