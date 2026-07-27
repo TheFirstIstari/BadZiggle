@@ -90,19 +90,106 @@ fn processFineChunk(ctx: *const FineCtx) void {
     }
 }
 
-// ── Scalar L1 distance ─────────────────────────────────────────────────────
+// ── SIMD L1 distance ─────────────────────────────────────────────────
+// Uses SIMD vector operations (SSE2/AVX2/NEON) for L1 distance computation.
+// Falls back to scalar when SIMD is not available.
+
+fn featureL1Simd(a: []const u8, b: []const u8) u32 {
+    std.debug.assert(a.len == b.len);
+
+    const opt_vl = std.simd.suggestVectorLength(u8);
+    if (opt_vl) |vl| {
+        var dist: u32 = 0;
+        var i: usize = 0;
+
+        while (i + vl <= a.len) : (i += vl) {
+            const va: @Vector(vl, u8) = @as(@Vector(vl, u8), a[i..][0..vl].*);
+            const vb: @Vector(vl, u8) = @as(@Vector(vl, u8), b[i..][0..vl].*);
+            const absdiff = @max(va, vb) - @min(va, vb);
+            const diff_arr: [vl]u8 = @bitCast(absdiff);
+            for (diff_arr) |d| {
+                dist += d;
+            }
+        }
+
+        // Scalar tail
+        while (i < a.len) : (i += 1) {
+            const d: i32 = @as(i32, @intCast(a[i])) - @as(i32, @intCast(b[i]));
+            const abs_d: u32 = if (d < 0) @intCast(-d) else @intCast(d);
+            if (dist > std.math.maxInt(u32) - abs_d) {
+                return std.math.maxInt(u32);
+            }
+            dist += abs_d;
+        }
+
+        return dist;
+    }
+
+    // Fallback to scalar when no SIMD vector length is suggested
+    return featureL1Scalar(a, b);
+}
+
+fn featureL1BoundedSimd(a: []const u8, b: []const u8, bound: u32) u32 {
+    std.debug.assert(a.len == b.len);
+
+    const opt_vl = std.simd.suggestVectorLength(u8);
+    if (opt_vl) |vl| {
+        var dist: u32 = 0;
+        var i: usize = 0;
+
+        while (i + vl <= a.len) : (i += vl) {
+            const va: @Vector(vl, u8) = @as(@Vector(vl, u8), a[i..][0..vl].*);
+            const vb: @Vector(vl, u8) = @as(@Vector(vl, u8), b[i..][0..vl].*);
+            const absdiff = @max(va, vb) - @min(va, vb);
+            const diff_arr: [vl]u8 = @bitCast(absdiff);
+            for (diff_arr) |d| {
+                dist += d;
+            }
+
+            if (dist > bound) return dist;
+        }
+
+        // Scalar tail
+        while (i < a.len) : (i += 1) {
+            const d: i32 = @as(i32, @intCast(a[i])) - @as(i32, @intCast(b[i]));
+            const abs_d: u32 = if (d < 0) @intCast(-d) else @intCast(d);
+
+            if (dist > std.math.maxInt(u32) - abs_d) {
+                return std.math.maxInt(u32);
+            }
+            dist += abs_d;
+
+            if (dist > bound) return dist;
+        }
+
+        return dist;
+    }
+
+    // Fallback to scalar
+    return featureL1BoundedScalar(a, b, bound);
+}
 
 /// Compute L1 (sum of absolute differences) distance between two feature vectors.
 /// Returns the distance as u32, capped at maxInt(u32).
 pub fn featureL1(a: []const u8, b: []const u8) u32 {
+    return featureL1Simd(a, b);
+}
+
+/// Compute L1 distance with early termination.
+/// Returns the partial distance (which may be >= bound if not pruned).
+pub fn featureL1Bounded(a: []const u8, b: []const u8, bound: u32) u32 {
+    return featureL1BoundedSimd(a, b, bound);
+}
+
+// ── Scalar fallbacks ──────────────────────────────────────────────────
+
+fn featureL1Scalar(a: []const u8, b: []const u8) u32 {
     std.debug.assert(a.len == b.len);
 
     var dist: u32 = 0;
     for (a, b) |aa, bb| {
         const d: i32 = @as(i32, @intCast(aa)) - @as(i32, @intCast(bb));
         const abs_d: u32 = if (d < 0) @intCast(-d) else @intCast(d);
-
-        // Check for overflow before adding
         if (dist > std.math.maxInt(u32) - abs_d) {
             return std.math.maxInt(u32);
         }
@@ -111,21 +198,17 @@ pub fn featureL1(a: []const u8, b: []const u8) u32 {
     return dist;
 }
 
-/// Compute L1 distance with early termination.
-/// Returns the partial distance (which may be >= bound if not pruned).
-pub fn featureL1Bounded(a: []const u8, b: []const u8, bound: u32) u32 {
+fn featureL1BoundedScalar(a: []const u8, b: []const u8, bound: u32) u32 {
     std.debug.assert(a.len == b.len);
 
     var dist: u32 = 0;
     for (a, b) |aa, bb| {
         const d: i32 = @as(i32, @intCast(aa)) - @as(i32, @intCast(bb));
         const abs_d: u32 = if (d < 0) @intCast(-d) else @intCast(d);
-
         if (dist > std.math.maxInt(u32) - abs_d) {
             return std.math.maxInt(u32);
         }
         dist += abs_d;
-
         if (dist > bound) return dist;
     }
     return dist;
