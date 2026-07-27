@@ -140,6 +140,34 @@ pub const AtlasCache = struct {
         return null;
     }
 
+    /// Resize the hash table when it reaches 75% capacity.
+    /// Doubles capacity and rehashes all valid entries (tombstones are dropped).
+    fn resize(self: *AtlasCache) void {
+        const old_capacity = self.capacity;
+        const new_capacity = old_capacity * 2;
+        const new_entries = self.allocator.alloc(AtlasEntry, new_capacity) catch return;
+        // Initialize all new slots as empty.
+        for (new_entries) |*e| e.* = AtlasEntry{};
+
+        // Rehash all valid entries into the new table.
+        for (self.entries) |e| {
+            if (e.valid != 1) continue;
+            const h = hash(e.op_id, e.tile_w, e.tile_h);
+            var probe: usize = 0;
+            while (probe < new_capacity) : (probe += 1) {
+                const idx = (h +% @as(u32, @intCast(probe))) & @as(u32, @intCast(new_capacity - 1));
+                if (new_entries[idx].valid == 0) {
+                    new_entries[idx] = e;
+                    break;
+                }
+            }
+        }
+
+        self.allocator.free(self.entries);
+        self.entries = new_entries;
+        self.capacity = new_capacity;
+    }
+
     fn evictLru(self: *AtlasCache) void {
         var oldest_idx: ?usize = null;
         var oldest_tick: u32 = std.math.maxInt(u32);
@@ -191,6 +219,11 @@ pub const AtlasCache = struct {
         if (!self.enabled) return;
 
         const entry_bytes = @as(u64, tw) * @as(u64, th) * @as(u64, src_channels);
+
+        // Resize if the table is 75% or more full.
+        if (self.count >= self.capacity * 3 / 4) {
+            self.resize();
+        }
 
         // Evict until we have room.
         while (self.total_bytes + entry_bytes > self.budget and self.count > 0) {
