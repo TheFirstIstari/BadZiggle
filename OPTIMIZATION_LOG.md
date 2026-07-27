@@ -61,3 +61,13 @@
 **Before:** TBD
 **After:** TBD
 **Verified:** `zig build` succeeds
+
+## Optimization 6: Pointer-Based Sobel Magnitude for Auto-Vectorization (Feature Xform)
+
+**Date:** 2026-07-27
+**File:** `src/imgops.zig`
+**Change:** Restructured `sobelMagnitude()` inner loop to use pointer-based iteration (`top`, `mid`, `bot`, `dst` raw pointers) instead of index-based slice access within the Sobel gradient computation. Replaced `for` loop with `while` loop to give the compiler stronger auto-vectorization hints. Moved `row_out` pointer computation before the row pointer setup for logical ordering.
+**Rationale:** The Sobel edge detection in `sobelMagnitude()` is part of the feature transform pipeline (computing edge features from grayscale tiles). The BadAppleStein C reference has explicit AVX2 and NEON SIMD implementations for this function that process 16 pixels at a time using platform intrinsics. The original Zig implementation used indexed slice access (`row_top[x - 1]`, etc.) which prevents the compiler from easily vectorizing the inner loop. Pointer-based iteration removes index arithmetic overhead and provides a more compiler-friendly access pattern that enables auto-vectorization on x86_64 (SSE2/AVX2) and ARM (NEON). The `while` loop structure also gives LLVM stronger optimization hints than the range-based `for` loop.
+**Before:** Indexed slice access in inner Sobel loop with `for` range iterator
+**After:** Pointer-based iteration with `while` loop for compiler auto-vectorization
+**Verified:** `zig build`, `zig build test`, and `./zig-out/bin/badziggle --help` all succeed
