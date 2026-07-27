@@ -61,3 +61,14 @@
 **Before:** TBD
 **After:** TBD
 **Verified:** `zig build` succeeds
+
+## Optimization 6: Pre-populate Atlas Cache Before Blit Phase (Render-Blitz)
+
+**Date:** 2026-07-27
+**File:** `render.zig`
+**Change:** Split `assembleFrame` into two phases: (1) pre-populate the atlas cache for all tile instructions by rendering source pages and caching tiles, (2) blit all instructions using only cache hits. Eliminated the single-pass approach that mixed render+cache+blit per instruction.
+**Rationale:** The C reference (BadApplestein `render.c` lines 858-865) pre-populates the atlas cache before the blit loop, ensuring every `atlas_lookup` is a cache hit during blitting. This avoids redundant source renders and scaling operations during the blit phase. The two-phase approach also simplifies the blit loop (no `need_free` / `loaded_img` tracking).
+**Reference:** `BadApplestein/src/render.c` — `atlas_cache_tile` pre-population (line 862) followed by blit loop (line 868).
+**Before:** Single-pass render+cache+blit per instruction; cache misses cause redundant source renders during blit.
+**After:** Two-phase: pre-populate atlas, then blit all with guaranteed cache hits.
+**Verified:** `zig build`, `zig build test`, and `./zig-out/bin/badziggle --help` all succeed
