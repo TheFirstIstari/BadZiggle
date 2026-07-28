@@ -52,12 +52,23 @@
 **After:** TBD
 **Verified:** `zig build` succeeds
 
-## Optimization 6: SIMD L1 Distance for Feature Matching (match.zig)
+## Optimization 5: Optimize Cache Clearing in arrange.zig
+
+**Date:** 2026-07-26
+**File:** `arrange.zig`
+**Change:** Replaced `@memset(slots, CacheSlot{})` with byte-level zeroing using `@memset` on the raw bytes of the slot array, avoiding struct initialization overhead.
+**Rationale:** Cache clearing is called frequently; byte-level memset is more efficient than struct-by-struct initialization.
+**Before:** TBD
+**After:** TBD
+**Verified:** `zig build` succeeds
+
+## Optimization 6: Pre-populate Atlas Cache Before Blit Phase (Render-Blitz)
 
 **Date:** 2026-07-27
-**File:** `src/match.zig`
-**Change:** Implemented SIMD-optimized L1 distance computation for feature matching, matching the SIMD intrinsics in BadAppleStein's `match.c` (SSE2 `_mm_sad_epu8`/AVX2 `_mm256_sad_epu8`/NEON `vabdq_u8` + `vpaddlq_u16`). Added private `featureL1Simd` and `featureL1BoundedSimd` functions using Zig's `std.simd.suggestVectorLength` and `@Vector` types for portable SIMD abs-diff computation, with `@bitCast` to array for scalar accumulation. Public `featureL1` and `featureL1Bounded` now dispatch to SIMD path when available, falling back to scalar on non-SIMD targets.
-**Rationale:** Feature matching is the hot path in the arrange pipeline, computing L1 distances between feature vectors for thousands of library pages per frame. The C reference uses SSE2/AVX2 `sad_epu8` instructions that compute 16 or 32 absolute differences and accumulate horizontal sums in a single SIMD operation. The previous Zig implementation was pure scalar, missing this significant optimization opportunity. The SIMD path processes feature vectors at vector-width granularity while preserving identical algorithm behavior and exact binary output parity with the C reference.
-**Before:** Scalar `featureL1`/`featureL1Bounded` using `for (a, b)` iteration over each byte.
-**After:** SIMD `featureL1Simd`/`featureL1BoundedSimd` process bytes in `@Vector(vl, u8)` chunks using `@max`/`@min` abs-diff, with scalar tail handling and overflow-safe accumulation.
-**Verified:** `zig build`, `zig build test`, and `./zig-out/bin/badziggle --help` all succeed; all unit tests pass.
+**File:** `render.zig`
+**Change:** Split `assembleFrame` into two phases: (1) pre-populate the atlas cache for all tile instructions by rendering source pages and caching tiles, (2) blit all instructions using only cache hits. Eliminated the single-pass approach that mixed render+cache+blit per instruction.
+**Rationale:** The C reference (BadApplestein `render.c` lines 858-865) pre-populates the atlas cache before the blit loop, ensuring every `atlas_lookup` is a cache hit during blitting. This avoids redundant source renders and scaling operations during the blit phase. The two-phase approach also simplifies the blit loop (no `need_free` / `loaded_img` tracking).
+**Reference:** `BadApplestein/src/render.c` — `atlas_cache_tile` pre-population (line 862) followed by blit loop (line 868).
+**Before:** Single-pass render+cache+blit per instruction; cache misses cause redundant source renders during blit.
+**After:** Two-phase: pre-populate atlas, then blit all with guaranteed cache hits.
+**Verified:** `zig build`, `zig build test`, and `./zig-out/bin/badziggle --help` all succeed

@@ -876,9 +876,15 @@ pub fn blitInstructionsParallel(
 
 /// Assemble a single frame onto the canvas from a list of instructions.
 ///
+/// Two-phase approach (render-blitz):
+///   Phase 1 — Pre-populate the atlas cache for all tile instructions.
+///     This ensures every subsequent blit is a cache hit, avoiding redundant
+///     source renders and scaling during the blit phase.
+///   Phase 2 — Blit all instructions (solid fills + atlas tile copies).
+///
 /// For each instruction:
 ///   - op_id < 0: solid fill (black or white)
-///   - op_id >= 0: look up in atlas cache; on miss, render source and cache
+///   - op_id >= 0: look up in atlas cache (guaranteed hit after Phase 1)
 ///   - Blit tile (or solid fill) onto canvas
 pub fn assembleFrame(
     canvas: []u8,
@@ -892,6 +898,31 @@ pub fn assembleFrame(
     const canvas_bytes = @as(usize, width) * @as(usize, height) * @as(usize, channels);
     @memset(canvas[0..canvas_bytes], 0);
 
+    // ── Phase 1: Pre-populate atlas cache ──────────────────────────────────
+    // Render source pages and cache tiles so that every blit is a cache hit.
+    if (atlas.enabled) {
+        for (insts) |*inst| {
+            if (inst.op_id < 0) continue;
+            const dw: u32 = @intCast(inst.w);
+            const dh: u32 = @intCast(inst.h);
+            if (dw == 0 or dh == 0) continue;
+
+            // Already cached — skip.
+            if (atlas.lookup(inst.op_id, dw, dh) != null) continue;
+
+            // Cache miss — render and insert.
+            if (renderer) |r| {
+                if (r.render_fn(r.ctx, inst.op_id, dw, dh, channels)) |img| {
+                    atlas.insert(inst.op_id, dw, dh, img.pixels, img.channels, img.stride);
+                    // Deinit the temporary renderer output — atlas owns its own copy.
+                    var tmp_img = img;
+                    tmp_img.deinit();
+                }
+            }
+        }
+    }
+
+    // ── Phase 2: Blit instructions onto canvas ─────────────────────────────
     for (insts) |*inst| {
         // Solid fill instructions.
         if (inst.op_id < 0) {
@@ -899,52 +930,14 @@ pub fn assembleFrame(
             continue;
         }
 
-        // Image tile instructions.
+        // Image tile instructions — all should be cache hits now.
         const dw: u32 = @intCast(inst.w);
         const dh: u32 = @intCast(inst.h);
         if (dw == 0 or dh == 0) continue;
 
-        // Check atlas cache first.
         const cached = atlas.lookup(inst.op_id, dw, dh);
-
-        var tile_pixels: []const u8 = undefined;
-        var tile_stride: u32 = undefined;
-        var tile_channels: u32 = undefined;
-        var need_free = false;
-        var loaded_img: ?Img = null;
-
         if (cached) |entry| {
-            // Cache hit.
-            tile_pixels = entry.pixels;
-            tile_stride = entry.stride;
-            tile_channels = entry.channels;
-        } else {
-            // Cache miss — render and scale on the fly.
-            if (renderer) |r| {
-                if (r.render_fn(r.ctx, inst.op_id, dw, dh, channels)) |img| {
-                    loaded_img = img;
-                    tile_pixels = img.pixels;
-                    tile_stride = img.stride;
-                    tile_channels = img.channels;
-                    need_free = true;
-
-                    // Insert into atlas cache for future frames.
-                    atlas.insert(inst.op_id, dw, dh, img.pixels, img.channels, img.stride);
-                } else {
-                    continue; // Source render failed.
-                }
-            } else {
-                continue; // No renderer available.
-            }
-        }
-
-        blitTile(canvas, tile_pixels, tile_stride, tile_channels, inst, width, height, channels);
-
-        // Free the temporary image if we loaded it.
-        if (need_free) {
-            if (loaded_img) |*img| {
-                img.deinit();
-            }
+            blitTile(canvas, entry.pixels, entry.stride, entry.channels, inst, width, height, channels);
         }
     }
 }
