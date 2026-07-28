@@ -140,23 +140,32 @@ pub const AtlasCache = struct {
         return null;
     }
 
-    /// Thread-safe read-only lookup for use during parallel blitting.
-    /// Does not update LRU, tick, or hit/miss counters — purely const access
-    /// so it can be called concurrently from multiple threads.
-    pub fn lookupReadOnly(self: *const AtlasCache, op_id: i32, tw: u32, th: u32) ?*const AtlasEntry {
-        if (!self.enabled) return null;
-        const h = hash(op_id, tw, th);
-        var probe: usize = 0;
-        while (probe < self.capacity) : (probe += 1) {
-            const idx = (h +% @as(u32, @intCast(probe))) & @as(u32, @intCast(self.capacity - 1));
-            const e = &self.entries[idx];
-            if (e.valid == 0) return null;
-            if (e.valid == 2) continue;
-            if (e.op_id == op_id and e.tile_w == tw and e.tile_h == th) {
-                return e;
+    /// Resize the hash table when it reaches 75% capacity.
+    /// Doubles capacity and rehashes all valid entries (tombstones are dropped).
+    fn resize(self: *AtlasCache) void {
+        const old_capacity = self.capacity;
+        const new_capacity = old_capacity * 2;
+        const new_entries = self.allocator.alloc(AtlasEntry, new_capacity) catch return;
+        // Initialize all new slots as empty.
+        for (new_entries) |*e| e.* = AtlasEntry{};
+
+        // Rehash all valid entries into the new table.
+        for (self.entries) |e| {
+            if (e.valid != 1) continue;
+            const h = hash(e.op_id, e.tile_w, e.tile_h);
+            var probe: usize = 0;
+            while (probe < new_capacity) : (probe += 1) {
+                const idx = (h +% @as(u32, @intCast(probe))) & @as(u32, @intCast(new_capacity - 1));
+                if (new_entries[idx].valid == 0) {
+                    new_entries[idx] = e;
+                    break;
+                }
             }
         }
-        return null;
+
+        self.allocator.free(self.entries);
+        self.entries = new_entries;
+        self.capacity = new_capacity;
     }
 
     fn evictLru(self: *AtlasCache) void {
@@ -210,6 +219,11 @@ pub const AtlasCache = struct {
         if (!self.enabled) return;
 
         const entry_bytes = @as(u64, tw) * @as(u64, th) * @as(u64, src_channels);
+
+        // Resize if the table is 75% or more full.
+        if (self.count >= self.capacity * 3 / 4) {
+            self.resize();
+        }
 
         // Evict until we have room.
         while (self.total_bytes + entry_bytes > self.budget and self.count > 0) {
@@ -720,171 +734,11 @@ pub const ImageSourceRenderer = struct {
     }
 };
 
-/// Pre-populate the atlas cache for all tiles needed by a frame's instructions.
-/// This is a single-threaded pass that renders source pages on demand and caches
-/// them so that the subsequent parallel blit loop only performs read-only lookups.
-pub fn atlasPrePopulate(
-    atlas: *AtlasCache,
-    insts: []const Inst,
-    renderer: ?*SourceRenderer,
-    channels: u32,
-) void {
-    for (insts) |*inst| {
-        if (inst.op_id < 0) continue;
-        const dw: u32 = @intCast(inst.w);
-        const dh: u32 = @intCast(inst.h);
-        if (dw == 0 or dh == 0) continue;
-
-        // Check if already cached.
-        if (atlas.lookup(inst.op_id, dw, dh)) |_| continue;
-
-        // Cache miss — render source and insert into atlas.
-        if (renderer) |r| {
-            if (r.render_fn(r.ctx, inst.op_id, dw, dh, channels)) |img| {
-                atlas.insert(inst.op_id, dw, dh, img.pixels, img.channels, img.stride);
-                var img_mut = img;
-                img_mut.deinit();
-            }
-        }
-    }
-}
-
-/// Per-thread context for parallel blitting, shared via allocator.
-const BlitThreadCtx = struct {
-    canvas: []u8,
-    insts: []const Inst,
-    atlas: *AtlasCache,
-    renderer: ?*SourceRenderer,
-    width: u32,
-    height: u32,
-    channels: u32,
-    start: usize,
-    end: usize,
-};
-
-/// Worker function for each blit thread — processes a contiguous chunk of
-/// instructions using read-only atlas lookups (lookupReadOnly).
-fn blitWorker(ctx: *BlitThreadCtx) void {
-    const insts = ctx.insts[ctx.start..ctx.end];
-    for (insts) |*inst| {
-        if (inst.op_id < 0) {
-            blitSolid(ctx.canvas, inst, ctx.width, ctx.height, ctx.channels);
-            continue;
-        }
-        const dw: u32 = @intCast(inst.w);
-        const dh: u32 = @intCast(inst.h);
-        if (dw == 0 or dh == 0) continue;
-
-        // Read-only atlas lookup — no LRU/hits/misses mutation, safe for concurrent use.
-        const cached = ctx.atlas.lookupReadOnly(inst.op_id, dw, dh);
-        if (cached) |entry| {
-            blitTile(ctx.canvas, entry.pixels, entry.stride, entry.channels, inst, ctx.width, ctx.height, ctx.channels);
-        } else if (ctx.renderer) |r| {
-            // Cache miss even after pre-population — render on the fly.
-            if (r.render_fn(r.ctx, inst.op_id, dw, dh, ctx.channels)) |img| {
-                blitTile(ctx.canvas, img.pixels, img.stride, img.channels, inst, ctx.width, ctx.height, ctx.channels);
-                var img_mut = img;
-                img_mut.deinit();
-            }
-        }
-    }
-}
-
-/// Parallel blit of instructions onto a canvas using a thread pool.
-/// All atlas tiles must be pre-populated before calling this function
-/// (see atlasPrePopulate). The atlas is used read-only during blitting
-/// (lookupReadOnly only), so it is safe to call concurrently from multiple threads.
-///
-/// Each thread processes a contiguous chunk of instructions. Instructions
-/// write to disjoint canvas regions (per-assumption from the manifest format),
-/// so no locking is needed for canvas access.
-pub fn blitInstructionsParallel(
-    canvas: []u8,
-    insts: []const Inst,
-    atlas: *AtlasCache,
-    renderer: ?*SourceRenderer,
-    width: u32,
-    height: u32,
-    channels: u32,
-    allocator: Allocator,
-    num_threads: u32,
-) !void {
-    const n = insts.len;
-    if (n == 0) return;
-
-    const use_threads = num_threads > 1 and n > num_threads;
-
-    if (!use_threads) {
-        // Single-threaded fallback.
-        for (insts) |*inst| {
-            if (inst.op_id < 0) {
-                blitSolid(canvas, inst, width, height, channels);
-                continue;
-            }
-            const dw: u32 = @intCast(inst.w);
-            const dh: u32 = @intCast(inst.h);
-            if (dw == 0 or dh == 0) continue;
-
-            const cached = atlas.lookupReadOnly(inst.op_id, dw, dh);
-            if (cached) |entry| {
-                blitTile(canvas, entry.pixels, entry.stride, entry.channels, inst, width, height, channels);
-            } else if (renderer) |r| {
-                if (r.render_fn(r.ctx, inst.op_id, dw, dh, channels)) |img| {
-                    blitTile(canvas, img.pixels, img.stride, img.channels, inst, width, height, channels);
-                    var img_mut = img;
-                    img_mut.deinit();
-                }
-            }
-        }
-        return;
-    }
-
-    // Multi-threaded path.
-    const chunk_size = (n + num_threads - 1) / num_threads;
-
-    var handles = try allocator.alloc(std.Thread, num_threads);
-    defer {
-        var t: u32 = 0;
-        while (t < num_threads) : (t += 1) {
-            handles[t].join();
-        }
-        allocator.free(handles);
-    }
-
-    var t: u32 = 0;
-    while (t < num_threads) : (t += 1) {
-        const start = @as(usize, t) * chunk_size;
-        const end = @min(start + chunk_size, n);
-        if (start >= n) break;
-
-        const ctx = try allocator.create(BlitThreadCtx);
-        ctx.* = .{
-            .canvas = canvas,
-            .insts = insts,
-            .atlas = atlas,
-            .renderer = renderer,
-            .width = width,
-            .height = height,
-            .channels = channels,
-            .start = start,
-            .end = end,
-        };
-
-        handles[t] = try std.Thread.spawn(.{}, blitWorker, .{ctx});
-    }
-}
-
 /// Assemble a single frame onto the canvas from a list of instructions.
-///
-/// Two-phase approach (render-blitz):
-///   Phase 1 — Pre-populate the atlas cache for all tile instructions.
-///     This ensures every subsequent blit is a cache hit, avoiding redundant
-///     source renders and scaling during the blit phase.
-///   Phase 2 — Blit all instructions (solid fills + atlas tile copies).
 ///
 /// For each instruction:
 ///   - op_id < 0: solid fill (black or white)
-///   - op_id >= 0: look up in atlas cache (guaranteed hit after Phase 1)
+///   - op_id >= 0: look up in atlas cache; on miss, render source and cache
 ///   - Blit tile (or solid fill) onto canvas
 pub fn assembleFrame(
     canvas: []u8,
@@ -898,31 +752,6 @@ pub fn assembleFrame(
     const canvas_bytes = @as(usize, width) * @as(usize, height) * @as(usize, channels);
     @memset(canvas[0..canvas_bytes], 0);
 
-    // ── Phase 1: Pre-populate atlas cache ──────────────────────────────────
-    // Render source pages and cache tiles so that every blit is a cache hit.
-    if (atlas.enabled) {
-        for (insts) |*inst| {
-            if (inst.op_id < 0) continue;
-            const dw: u32 = @intCast(inst.w);
-            const dh: u32 = @intCast(inst.h);
-            if (dw == 0 or dh == 0) continue;
-
-            // Already cached — skip.
-            if (atlas.lookup(inst.op_id, dw, dh) != null) continue;
-
-            // Cache miss — render and insert.
-            if (renderer) |r| {
-                if (r.render_fn(r.ctx, inst.op_id, dw, dh, channels)) |img| {
-                    atlas.insert(inst.op_id, dw, dh, img.pixels, img.channels, img.stride);
-                    // Deinit the temporary renderer output — atlas owns its own copy.
-                    var tmp_img = img;
-                    tmp_img.deinit();
-                }
-            }
-        }
-    }
-
-    // ── Phase 2: Blit instructions onto canvas ─────────────────────────────
     for (insts) |*inst| {
         // Solid fill instructions.
         if (inst.op_id < 0) {
@@ -930,14 +759,52 @@ pub fn assembleFrame(
             continue;
         }
 
-        // Image tile instructions — all should be cache hits now.
+        // Image tile instructions.
         const dw: u32 = @intCast(inst.w);
         const dh: u32 = @intCast(inst.h);
         if (dw == 0 or dh == 0) continue;
 
+        // Check atlas cache first.
         const cached = atlas.lookup(inst.op_id, dw, dh);
+
+        var tile_pixels: []const u8 = undefined;
+        var tile_stride: u32 = undefined;
+        var tile_channels: u32 = undefined;
+        var need_free = false;
+        var loaded_img: ?Img = null;
+
         if (cached) |entry| {
-            blitTile(canvas, entry.pixels, entry.stride, entry.channels, inst, width, height, channels);
+            // Cache hit.
+            tile_pixels = entry.pixels;
+            tile_stride = entry.stride;
+            tile_channels = entry.channels;
+        } else {
+            // Cache miss — render and scale on the fly.
+            if (renderer) |r| {
+                if (r.render_fn(r.ctx, inst.op_id, dw, dh, channels)) |img| {
+                    loaded_img = img;
+                    tile_pixels = img.pixels;
+                    tile_stride = img.stride;
+                    tile_channels = img.channels;
+                    need_free = true;
+
+                    // Insert into atlas cache for future frames.
+                    atlas.insert(inst.op_id, dw, dh, img.pixels, img.channels, img.stride);
+                } else {
+                    continue; // Source render failed.
+                }
+            } else {
+                continue; // No renderer available.
+            }
+        }
+
+        blitTile(canvas, tile_pixels, tile_stride, tile_channels, inst, width, height, channels);
+
+        // Free the temporary image if we loaded it.
+        if (need_free) {
+            if (loaded_img) |*img| {
+                img.deinit();
+            }
         }
     }
 }
@@ -974,7 +841,6 @@ pub const RenderOptions = struct {
     fps: f64 = 0.0,
     max_frames: u32 = 0,
     channels: u32 = 1,
-    num_threads: u32 = 0,
 };
 
 /// Summary returned after rendering completes.
@@ -1084,9 +950,6 @@ pub fn render(
     // Start encoder thread.
     const enc_thread = try std.Thread.spawn(.{}, EncodePipeline.encoderThreadFn, .{&pipeline});
 
-    // ── Determine thread count for frame assembly ──────────────────────
-    const num_threads = if (opts.num_threads > 0) opts.num_threads else @max(1, @as(u32, @intCast(std.Thread.getCpuCount() catch 1)));
-
     // ── Process frames ──────────────────────────────────────────────
     var frames_done: u32 = 0;
     const start_time = std.Io.Clock.now(.awake, io).nanoseconds;
@@ -1094,17 +957,8 @@ pub fn render(
     for (0..max_frames_actual) |fi| {
         const insts = loaded[fi].insts;
 
-        // Pre-populate atlas cache for this frame's tiles (single-threaded).
-        if (atlas.enabled and insts.len > 0) {
-            atlasPrePopulate(&atlas, insts, source_renderer, channels);
-        }
-
-        // Assemble frame — parallel blit across threads.
-        try blitInstructionsParallel(canvas, insts, &atlas, source_renderer, width, height, channels, allocator, num_threads);
-
-        // Push to encode pipeline.
-        try pipeline.push(canvas);
-        frames_done +|= 1;
+        // Assemble frame.
+        assembleFrame(canvas, insts, &atlas, source_renderer, width, height, channels);
 
         // Push to encode pipeline.
         try pipeline.push(canvas);
