@@ -52,16 +52,22 @@
 **After:** TBD
 **Verified:** `zig build` succeeds
 
+## Optimization 5: Optimize Cache Clearing in arrange.zig
+
+**Date:** 2026-07-26
+**File:** `arrange.zig`
+**Change:** Replaced `@memset(slots, CacheSlot{})` with byte-level zeroing using `@memset` on the raw bytes of the slot array, avoiding struct initialization overhead.
+**Rationale:** Cache clearing is called frequently; byte-level memset is more efficient than struct-by-struct initialization.
 **Before:** TBD
 **After:** TBD
 **Verified:** `zig build` succeeds
 
-## Optimization 6: Dynamic Hash Table Resizing for AtlasCache (atlas-hash)
+## Optimization 6: Pointer-Based Sobel Magnitude for Auto-Vectorization (Feature Xform)
 
 **Date:** 2026-07-27
-**File:** `render.zig`
-**Change:** Added `resize()` method to `AtlasCache` that doubles capacity and rehashes all valid entries when the table reaches 75% load factor. Added resize trigger check at the start of `insert()`. Tombstone entries (valid == 2) are dropped during rehashing.
-**Rationale:** The C reference (BadAppleStein `render.c`) dynamically resizes the atlas hash table when `count >= capacity * 3 / 4`, doubling capacity and rehashing all valid entries. Without resizing, the fixed 256-capacity table causes increasingly long probe sequences as entries accumulate, degrading lookup performance from O(1) to O(n). The resize maintains amortized O(1) lookups and inserts while keeping memory overhead reasonable. During rehashing, tombstone slots are naturally dropped (only valid == 1 entries are rehashed).
-**Before:** Fixed 256-entry hash table; O(n) probe sequences at high load
-**After:** Dynamic resizing maintains ~50-75% load factor for O(1) amortized operations
+**File:** `src/imgops.zig`
+**Change:** Restructured `sobelMagnitude()` inner loop to use pointer-based iteration (`top`, `mid`, `bot`, `dst` raw pointers) instead of index-based slice access within the Sobel gradient computation. Replaced `for` loop with `while` loop to give the compiler stronger auto-vectorization hints. Moved `row_out` pointer computation before the row pointer setup for logical ordering.
+**Rationale:** The Sobel edge detection in `sobelMagnitude()` is part of the feature transform pipeline (computing edge features from grayscale tiles). The BadAppleStein C reference has explicit AVX2 and NEON SIMD implementations for this function that process 16 pixels at a time using platform intrinsics. The original Zig implementation used indexed slice access (`row_top[x - 1]`, etc.) which prevents the compiler from easily vectorizing the inner loop. Pointer-based iteration removes index arithmetic overhead and provides a more compiler-friendly access pattern that enables auto-vectorization on x86_64 (SSE2/AVX2) and ARM (NEON). The `while` loop structure also gives LLVM stronger optimization hints than the range-based `for` loop.
+**Before:** Indexed slice access in inner Sobel loop with `for` range iterator
+**After:** Pointer-based iteration with `while` loop for compiler auto-vectorization
 **Verified:** `zig build`, `zig build test`, and `./zig-out/bin/badziggle --help` all succeed
