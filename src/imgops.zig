@@ -9,7 +9,92 @@ const luma_b: u32 = 29;
 const luma_g: u32 = 150;
 const luma_r: u32 = 77;
 
+// ── SIMD-optimized BGR→grayscale ──────────────────────────────────
+// Mirrors BadApplestein's img_to_gray_simd (SSSE2/AVX2/NEON) using
+// portable std.simd.
+
+fn computeLuma5(bgr: @Vector(16, u8)) @Vector(5, u8) {
+    // B channel indices (pixels 0-4): byte offsets 0,3,6,9,12
+    const b_mask: @Vector(5, i32) = .{ 0, 3, 6, 9, 12 };
+    const g_mask: @Vector(5, i32) = .{ 1, 4, 7, 10, 13 };
+    const r_mask: @Vector(5, i32) = .{ 2, 5, 8, 11, 14 };
+
+    const b_ch = @shuffle(u8, bgr, undefined, b_mask);
+    const g_ch = @shuffle(u8, bgr, undefined, g_mask);
+    const r_ch = @shuffle(u8, bgr, undefined, r_mask);
+
+    // (29*B + 150*G + 77*R + 128) >> 8, saturating at 255.
+    var luma: [5]u8 = undefined;
+    inline for (0..5) |i| {
+        const val = @as(u32, b_ch[i]) * 29 + @as(u32, g_ch[i]) * 150 + @as(u32, r_ch[i]) * 77 + 128;
+        luma[i] = @intCast(@min(val >> 8, 255));
+    }
+    return @as(@Vector(5, u8), luma);
+}
+
+fn computeLuma10(bgr: @Vector(32, u8)) @Vector(10, u8) {
+    // B channel indices (pixels 0-9): byte offsets 0,3,6,...,27
+    const b_mask: @Vector(10, i32) = .{ 0, 3, 6, 9, 12, 15, 18, 21, 24, 27 };
+    const g_mask: @Vector(10, i32) = .{ 1, 4, 7, 10, 13, 16, 19, 22, 25, 28 };
+    const r_mask: @Vector(10, i32) = .{ 2, 5, 8, 11, 14, 17, 20, 23, 26, 29 };
+
+    const b_ch = @shuffle(u8, bgr, undefined, b_mask);
+    const g_ch = @shuffle(u8, bgr, undefined, g_mask);
+    const r_ch = @shuffle(u8, bgr, undefined, r_mask);
+
+    var luma: [10]u8 = undefined;
+    inline for (0..10) |i| {
+        const val = @as(u32, b_ch[i]) * 29 + @as(u32, g_ch[i]) * 150 + @as(u32, r_ch[i]) * 77 + 128;
+        luma[i] = @intCast(@min(val >> 8, 255));
+    }
+    return @as(@Vector(10, u8), luma);
+}
+
+/// SIMD-accelerated BGR→grayscale row conversion using std.simd.
+/// Processes `batch = suggestVectorLength(u8) / 3` pixels per SIMD iteration.
+fn imgToGraySimdRow(src_row: []const u8, dst_row: []u8, w: usize) void {
+    const opt_vl = std.simd.suggestVectorLength(u8);
+    if (opt_vl) |vl| {
+        const batch = vl / 3;
+        if (batch < 4) {
+            // Vector length too small to benefit from SIMD; scalar is fine.
+            return;
+        }
+
+        var x: usize = 0;
+        if (batch == 5) {
+            while (x + 5 <= w) {
+                const bgr = @as(@Vector(16, u8), @bitCast(src_row[x * 3 ..][0..16].*));
+                const luma = computeLuma5(bgr);
+                const luma_arr: [5]u8 = @bitCast(luma);
+                @memcpy(dst_row[x .. x + 5], luma_arr[0..5]);
+                x += 5;
+            }
+        } else if (batch == 10) {
+            while (x + 10 <= w) {
+                const bgr = @as(@Vector(32, u8), @bitCast(src_row[x * 3 ..][0..32].*));
+                const luma = computeLuma10(bgr);
+                const luma_arr: [10]u8 = @bitCast(luma);
+                @memcpy(dst_row[x .. x + 10], luma_arr[0..10]);
+                x += 10;
+            }
+        } else {
+            // Unrecognized batch size; use scalar.
+            return;
+        }
+        // Scalar tail for remaining pixels.
+        while (x < w) {
+            const p = src_row[x * 3 ..][0..3];
+            const v = (luma_b * p[0] + luma_g * p[1] + luma_r * p[2] + 128) >> 8;
+            dst_row[x] = @intCast(@min(v, 255));
+            x += 1;
+        }
+    }
+}
+
 /// Convert an RGB/BGR Img to grayscale using Rec.601 luma.
+/// Uses SIMD-accelerated processing (SSSE2/AVX2 portable SIMD) when
+/// the target vector width allows batching of 4+ pixels per iteration.
 /// If src is already grayscale (channels==1), returns a copy.
 /// Caller owns the returned Img and must call deinit() on it.
 pub fn toGray(src: *const Img) !Img {
@@ -23,11 +108,9 @@ pub fn toGray(src: *const Img) !Img {
     for (0..src.h) |y| {
         const src_row_offset = y * src.stride;
         const dst_row_offset = y * @as(usize, dst.w);
-        for (0..src.w) |x| {
-            const p = src.pixels[src_row_offset + x * 3 ..][0..3];
-            const v = (luma_b * p[0] + luma_g * p[1] + luma_r * p[2] + 128) >> 8;
-            dst.pixels[dst_row_offset + x] = @intCast(@min(v, 255));
-        }
+        const src_row = src.pixels[src_row_offset ..][0 .. src.w * 3];
+        const dst_row = dst.pixels[dst_row_offset ..];
+        imgToGraySimdRow(src_row, dst_row, src.w);
     }
     return dst;
 }
