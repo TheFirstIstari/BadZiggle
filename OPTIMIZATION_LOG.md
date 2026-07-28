@@ -71,3 +71,26 @@
 **Before:** Indexed slice access in inner Sobel loop with `for` range iterator
 **After:** Pointer-based iteration with `while` loop for compiler auto-vectorization
 **Verified:** `zig build`, `zig build test`, and `./zig-out/bin/badziggle --help` all succeed
+
+## Optimization 7: SIMD-Accelerated BGR→Grayscale (Coarse SIMD)
+
+**Date:** 2026-07-28
+**File:** `src/imgops.zig`
+**Change:** Added `imgToGraySimdRow()` which uses `std.simd` portable SIMD to
+process multiple BGR pixels simultaneously, mirroring BadApplestein's
+`img_to_gray_simd` (SSSE2/AVX2/NEON) in imgops.c and Odin's `core:simd`
+implementation in BadOdinStein-odin-simd-gray. Added `computeLuma5()` for
+batch=5 (vl=16, SSSE2-class) and `computeLuma10()` for batch=10 (vl=32,
+AVX2-class), using `@shuffle` for channel extraction (mirrors PSHUFB/tbl
+intrinsics), and scalar fallbacks for tail pixels and unknown vector lengths.
+**Rationale:** The BGR→grayscale conversion in `toGray()` was the last major
+image pipeline function missing explicit SIMD acceleration. The C reference
+processes 5 pixels/iteration (SSSE2) or 10 pixels/iteration (AVX2) using
+explicit intrinsics. The original Zig code was scalar pixel-by-pixel. The
+portable `std.simd` path achieves the same throughput without target-specific
+compiler flags, matching the C reference's algorithmic approach while remaining
+cross-platform.
+**Before:** Scalar pixel-by-pixel BGR→luma in `toGray()`
+**After:** SIMD batch processing (5 or 10 pixels/iteration via shuffle-based
+channel extraction) with scalar tail fallback
+**Verified:** `zig build`, `zig build test`, and `./zig-out/bin/badziggle --help` all succeed
