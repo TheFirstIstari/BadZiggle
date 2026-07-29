@@ -37,7 +37,7 @@ const FNV_PRIME: u64 = 1099511628211;
 // ---------------------------------------------------------------------------
 
 /// FNV-1a 64-bit hash. Returns h | 1 (0 = empty sentinel).
-fn fnv1a64(data: []const u8) u64 {
+inline fn fnv1a64(data: []const u8) u64 {
     var h: u64 = FNV_OFFSET;
     for (data) |byte| {
         h ^= byte;
@@ -48,7 +48,7 @@ fn fnv1a64(data: []const u8) u64 {
 
 /// Hash a full feature vector using a sparse 64-byte sample across all scales.
 /// This is fast (~64 ns/tile) and collision probability is negligible.
-fn fullFeatHash(feat: []const u8) u64 {
+inline fn fullFeatHash(feat: []const u8) u64 {
     var h: u64 = FNV_OFFSET;
     const n: usize = @min(feat.len, 64);
     var step: usize = feat.len / n;
@@ -62,7 +62,7 @@ fn fullFeatHash(feat: []const u8) u64 {
 }
 
 /// Hash a coarse feature (≤ 1 KB) — hash all bytes (~1 μs).
-fn coarseFeatHash(feat: []const u8) u64 {
+inline fn coarseFeatHash(feat: []const u8) u64 {
     return fnv1a64(feat);
 }
 
@@ -232,6 +232,9 @@ pub const Arranger = struct {
     coarse_cache: Cache,
     full_cache: Cache,
 
+    /// Reusable arena for per-frame allocations.
+    arena: std.heap.ArenaAllocator,
+
     pub fn init(allocator: Allocator, db: *const FeatureDB, fw: u32, fh: u32, max_block_pct: f64, hero_min_pct: f64) Arranger {
         const coarse_len_val = db.scales[0] * db.scales[0];
 
@@ -258,6 +261,7 @@ pub const Arranger = struct {
             .miss_idx = .empty,
             .coarse_cache = Cache.init(allocator),
             .full_cache = Cache.init(allocator),
+            .arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
@@ -266,6 +270,7 @@ pub const Arranger = struct {
         self.miss_idx.deinit(self.allocator);
         self.coarse_cache.deinit();
         self.full_cache.deinit();
+        self.arena.deinit();
     }
 
     // -------------------------------------------------------------------
@@ -451,6 +456,7 @@ pub const Arranger = struct {
     /// Updates manifest entries in-place with matched op_id and page_idx.
     fn extractAndMatch(
         self: *Arranger,
+        frame_allocator: Allocator,
         gray: []const u8,
         color_pixels: []const u8,
         color_stride: u32,
@@ -470,8 +476,7 @@ pub const Arranger = struct {
 
         // ── Phase 2: Pre-allocate feature buffer for all tiles ──────
         const feat_bufs_len = n_specs * feat_len;
-        var feat_bufs = try self.allocator.alloc(u8, feat_bufs_len);
-        defer self.allocator.free(feat_bufs);
+        var feat_bufs = try frame_allocator.alloc(u8, feat_bufs_len);
 
         // ── Phase 3: Coarse cache check + full feature extraction ───
         // Ensure coarse_hit buffer.
@@ -485,12 +490,10 @@ pub const Arranger = struct {
         // Pre-allocate reusable buffers to avoid per-tile allocation in the hot loop.
         const N: u32 = self.scales[0];
         const coarse_feat_len: usize = @as(usize, N) * N;
-        var coarse_feat = try self.allocator.alloc(u8, coarse_feat_len);
-        defer self.allocator.free(coarse_feat);
+        var coarse_feat = try frame_allocator.alloc(u8, coarse_feat_len);
 
         const max_crop_len: usize = @as(usize, self.max_block) * @as(usize, self.max_block) * @as(usize, db.channels);
-        var crop_buf = try self.allocator.alloc(u8, max_crop_len);
-        defer self.allocator.free(crop_buf);
+        var crop_buf = try frame_allocator.alloc(u8, max_crop_len);
 
         // Extract coarse features and check coarse cache.
         for (specs.items, 0..) |*sp, i| {
@@ -520,33 +523,54 @@ pub const Arranger = struct {
             const sh = sp_h;
             const maxv: u32 = (@as(u32, 1) << @intCast(self.G)) - 1;
 
-            for (0..N) |dy| {
-                const sy0: u32 = @intCast(@as(u64, dy) * sh / N);
-                var sy1: u32 = @intCast(@as(u64, dy + 1) * sh / N);
-                if (sy1 > sh) sy1 = sh;
-                for (0..N) |dx| {
-                    const sx0: u32 = @intCast(@as(u64, dx) * sw / N);
-                    var sx1: u32 = @intCast(@as(u64, dx + 1) * sw / N);
-                    if (sx1 > sw) sx1 = sw;
-                    var psum: u64 = 0;
-                    var sy = sy0;
-                    while (sy < sy1) : (sy += 1) {
-                        var sx = sx0;
-                        while (sx < sx1) : (sx += 1) {
-                            if (db.channels == 3) {
+            if (db.channels == 3) {
+                for (0..N) |dy| {
+                    const sy0: u32 = @intCast(@as(u64, dy) * sh / N);
+                    var sy1: u32 = @intCast(@as(u64, dy + 1) * sh / N);
+                    if (sy1 > sh) sy1 = sh;
+                    for (0..N) |dx| {
+                        const sx0: u32 = @intCast(@as(u64, dx) * sw / N);
+                        var sx1: u32 = @intCast(@as(u64, dx + 1) * sw / N);
+                        if (sx1 > sw) sx1 = sw;
+                        var psum: u64 = 0;
+                        var sy = sy0;
+                        while (sy < sy1) : (sy += 1) {
+                            var sx = sx0;
+                            while (sx < sx1) : (sx += 1) {
                                 const offset = @as(usize, sy) * sp_w * 3 + sx * 3;
                                 psum += (@as(u64, 29) * crop_buf[offset] +
                                     150 * crop_buf[offset + 1] +
                                     77 * crop_buf[offset + 2]) >> 8;
-                            } else {
+                            }
+                        }
+                        const area: u32 = (sy1 - sy0) * (sx1 - sx0);
+                        const v: u32 = if (area > 0) @intCast(psum / area) else 0;
+                        const q: u32 = if (self.G >= 8) v else (v * maxv + 127) / 255;
+                        coarse_feat[dy * N + dx] = @intCast(@min(q, maxv));
+                    }
+                }
+            } else {
+                for (0..N) |dy| {
+                    const sy0: u32 = @intCast(@as(u64, dy) * sh / N);
+                    var sy1: u32 = @intCast(@as(u64, dy + 1) * sh / N);
+                    if (sy1 > sh) sy1 = sh;
+                    for (0..N) |dx| {
+                        const sx0: u32 = @intCast(@as(u64, dx) * sw / N);
+                        var sx1: u32 = @intCast(@as(u64, dx + 1) * sw / N);
+                        if (sx1 > sw) sx1 = sw;
+                        var psum: u64 = 0;
+                        var sy = sy0;
+                        while (sy < sy1) : (sy += 1) {
+                            var sx = sx0;
+                            while (sx < sx1) : (sx += 1) {
                                 psum += crop_buf[@as(usize, sy) * sw + sx];
                             }
                         }
+                        const area: u32 = (sy1 - sy0) * (sx1 - sx0);
+                        const v: u32 = if (area > 0) @intCast(psum / area) else 0;
+                        const q: u32 = if (self.G >= 8) v else (v * maxv + 127) / 255;
+                        coarse_feat[dy * N + dx] = @intCast(@min(q, maxv));
                     }
-                    const area: u32 = (sy1 - sy0) * (sx1 - sx0);
-                    const v: u32 = if (area > 0) @intCast(psum / area) else 0;
-                    const q: u32 = if (self.G >= 8) v else (v * maxv + 127) / 255;
-                    coarse_feat[dy * N + dx] = @intCast(@min(q, maxv));
                 }
             }
 
@@ -601,7 +625,7 @@ pub const Arranger = struct {
             } else {
                 try self.miss_idx.append(self.allocator, i);
                 // Copy feature into tiles buffer for batch matching.
-                try tiles_buf.appendSlice(self.allocator, feat);
+                try tiles_buf.appendSlice(frame_allocator, feat);
             }
         }
 
@@ -610,18 +634,51 @@ pub const Arranger = struct {
             const nt: u32 = @intCast(self.miss_idx.items.len);
             const coarse_for_match = self.coarse_len;
 
+            // ── Feature deduplication ─────────────────────────────────
+            // Many tiles share identical features (especially in monochrome video).
+            // Match each unique feature only once, then broadcast results to duplicates.
+            // This significantly reduces matching work when frames contain repeated tile patterns.
+            var unique_nt: u32 = 0;
+            const dedup_map = try frame_allocator.alloc(u32, nt);
+            {
+                var i: u32 = 0;
+                while (i < nt) : (i += 1) {
+                    const feat_i = tiles_buf.items[@as(usize, i) * feat_len ..][0..feat_len];
+                    const h_i = fullFeatHash(feat_i);
+                    var found_dup = false;
+                    var j: u32 = 0;
+                    while (j < unique_nt) : (j += 1) {
+                        const feat_j = tiles_buf.items[@as(usize, j) * feat_len ..][0..feat_len];
+                        const h_j = fullFeatHash(feat_j);
+                        if (h_i == h_j) {
+                            dedup_map[i] = j;
+                            found_dup = true;
+                            break;
+                        }
+                    }
+                    if (!found_dup) {
+                        dedup_map[i] = unique_nt;
+                        if (unique_nt != i) {
+                            @memcpy(tiles_buf.items[@as(usize, unique_nt) * feat_len ..][0..feat_len], feat_i);
+                        }
+                        unique_nt += 1;
+                    }
+                }
+            }
+
             const results = try match_mod.matchBatchCoarse(
-                self.allocator,
+                frame_allocator,
                 db.data,
-                tiles_buf.items[0 .. @as(usize, nt) * feat_len],
+                tiles_buf.items[0 .. @as(usize, unique_nt) * feat_len],
                 db.n_pages,
-                nt,
+                unique_nt,
                 @intCast(feat_len),
                 coarse_for_match,
             );
-            defer self.allocator.free(results);
+            defer frame_allocator.free(results);
 
-            for (results, 0..) |pid, i| {
+            for (dedup_map, 0..) |dup_idx, i| {
+                const pid = results[dup_idx];
                 const midx = specs.items[self.miss_idx.items[i]].manifest_idx;
                 manifest.items[midx].op_id = pid;
                 manifest.items[midx].page_idx = reg.entries[@intCast(pid)].page_idx;
@@ -654,19 +711,23 @@ pub const Arranger = struct {
         reg: *const Registry,
         t: *Timings,
     ) !std.ArrayList(Inst) {
+        _ = self.arena.reset(.retain_capacity);
+        const aa = self.arena.allocator();
+
         var manifest: std.ArrayList(Inst) = .empty;
         errdefer manifest.deinit(self.allocator);
 
         var tiles_buf: std.ArrayList(u8) = .empty;
-        defer tiles_buf.deinit(self.allocator);
+        // tiles_buf is allocated from the arena (aa); arena.deinit() handles cleanup.
 
         var specs = try self.solveGreedy(gray, w, h, &manifest);
         defer specs.deinit(self.allocator);
 
         // Pre-size tiles_buf to avoid reallocations during miss collection.
-        try tiles_buf.ensureTotalCapacityPrecise(self.allocator, specs.items.len * db.feat_len);
+        try tiles_buf.ensureTotalCapacityPrecise(aa, specs.items.len * db.feat_len);
 
         try self.extractAndMatch(
+            aa,
             gray,
             color_pixels,
             color_stride,

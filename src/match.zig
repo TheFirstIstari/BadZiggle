@@ -42,6 +42,123 @@ const FineCtx = struct {
     end_target: u32,
 };
 
+// ── Thread pool ─────────────────────────────────────────────────────
+
+/// Minimal thread pool for fork-join parallelism.
+/// Reuses threads across multiple work stages.
+/// Uses a spinlock-based work queue (no Io dependency).
+const ThreadPool = struct {
+    const Task = struct {
+        func: *const fn (ctx: *anyopaque) void,
+        ctx: *anyopaque,
+    };
+
+    allocator: std.mem.Allocator,
+    threads: []std.Thread,
+    running: std.atomic.Value(bool),
+
+    // Spinlock + work queue
+    _pad0: [std.atomic.cache_line]u8 = undefined,
+    spin: std.atomic.Value(u32) = .init(0),
+    tasks: std.ArrayListUnmanaged(Task) = .{ .items = &.{}, .capacity = 0 },
+    _pad1: [std.atomic.cache_line]u8 = undefined,
+    pending: std.atomic.Value(usize) = .init(0),
+
+    fn init(allocator: std.mem.Allocator, n_jobs: u32) !ThreadPool {
+        var pool = ThreadPool{
+            .allocator = allocator,
+            .threads = try allocator.alloc(std.Thread, n_jobs),
+            .running = .init(true),
+        };
+        for (pool.threads) |*t| {
+            t.* = try std.Thread.spawn(.{}, workerFn, .{&pool});
+        }
+        return pool;
+    }
+
+    fn lockAcquire(pool: *ThreadPool) void {
+        const max_spin: u32 = 64;
+        var spin_count: u32 = 0;
+        while (true) {
+            @branchHint(.likely);
+            if (pool.spin.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) return;
+            var i: u32 = 0;
+            const limit = @as(u32, 1) << @min(spin_count, @as(u32, 10));
+            while (i < limit) : (i += 1) {
+                std.mem.doNotOptimizeAway(i);
+                if (pool.spin.load(.monotonic) == 0) break;
+            }
+            spin_count +|= 1;
+            if (spin_count > max_spin) {
+                std.Thread.yield() catch {};
+                spin_count = 0;
+            }
+        }
+    }
+
+    fn lockRelease(pool: *ThreadPool) void {
+        pool.spin.store(0, .release);
+    }
+
+    fn workerFn(pool: *ThreadPool) void {
+        while (pool.running.load(.acquire)) {
+            const task = blk: {
+                pool.lockAcquire();
+                defer pool.lockRelease();
+                break :blk pool.tasks.pop();
+            } orelse {
+                std.Thread.yield() catch {};
+                continue;
+            };
+            task.func(task.ctx);
+            _ = pool.pending.fetchSub(1, .release);
+        }
+    }
+
+    fn spawn(pool: *ThreadPool, comptime func: anytype, args: anytype) !void {
+        const ArgsT = @TypeOf(args);
+        const Wrapper = struct {
+            fn call(ptr: *anyopaque) void {
+                @call(.auto, func, @as(*const ArgsT, @alignCast(@ptrCast(ptr))).*);
+            }
+        };
+
+        const args_copy = try pool.allocator.create(ArgsT);
+        args_copy.* = args;
+
+        pool.lockAcquire();
+        defer pool.lockRelease();
+        pool.tasks.append(pool.allocator, .{
+            .func = Wrapper.call,
+            .ctx = args_copy,
+        }) catch {
+            pool.allocator.destroy(args_copy);
+            @panic("OOM");
+        };
+
+        // Increment pending AFTER the task is safely in the queue.
+        // This ensures wait() never sees a pending count that exceeds
+        // the actual number of queued tasks, and a worker popping the
+        // task under the lock will find it.
+        _ = pool.pending.fetchAdd(1, .release);
+    }
+
+    /// Wait for all pending tasks to complete.
+    fn wait(pool: *ThreadPool) void {
+        while (pool.pending.load(.acquire) > 0) {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn deinit(pool: *ThreadPool) void {
+        pool.wait();
+        pool.running.store(false, .release);
+        for (pool.threads) |t| t.join();
+        pool.allocator.free(pool.threads);
+        pool.tasks.deinit(pool.allocator);
+    }
+};
+
 // ── Thread workers ──────────────────────────────────────────────────
 
 fn processCoarseChunk(ctx: *const CoarseCtx) void {
@@ -95,10 +212,13 @@ fn processFineChunk(ctx: *const FineCtx) void {
 // Falls back to scalar when SIMD is not available.
 
 fn featureL1Simd(a: []const u8, b: []const u8) u32 {
+    @setRuntimeSafety(false);
+    defer @setRuntimeSafety(true);
     std.debug.assert(a.len == b.len);
 
     const opt_vl = std.simd.suggestVectorLength(u8);
     if (opt_vl) |vl| {
+        @branchHint(.likely);
         var dist: u32 = 0;
         var i: usize = 0;
 
@@ -106,10 +226,9 @@ fn featureL1Simd(a: []const u8, b: []const u8) u32 {
             const va: @Vector(vl, u8) = @as(@Vector(vl, u8), a[i..][0..vl].*);
             const vb: @Vector(vl, u8) = @as(@Vector(vl, u8), b[i..][0..vl].*);
             const absdiff = @max(va, vb) - @min(va, vb);
-            const diff_arr: [vl]u8 = @bitCast(absdiff);
-            for (diff_arr) |d| {
-                dist += d;
-            }
+            // Zero-extend to u32 to avoid overflow in the horizontal sum
+            const widened: @Vector(vl, u32) = @intCast(absdiff);
+            dist += @reduce(.Add, widened);
         }
 
         // Scalar tail
@@ -123,13 +242,16 @@ fn featureL1Simd(a: []const u8, b: []const u8) u32 {
         }
 
         return dist;
+    } else {
+        @branchHint(.unlikely);
+        // Fallback to scalar when no SIMD vector length is suggested
+        return featureL1Scalar(a, b);
     }
-
-    // Fallback to scalar when no SIMD vector length is suggested
-    return featureL1Scalar(a, b);
 }
 
 fn featureL1BoundedSimd(a: []const u8, b: []const u8, bound: u32) u32 {
+    @setRuntimeSafety(false);
+    defer @setRuntimeSafety(true);
     std.debug.assert(a.len == b.len);
 
     const opt_vl = std.simd.suggestVectorLength(u8);
@@ -141,12 +263,14 @@ fn featureL1BoundedSimd(a: []const u8, b: []const u8, bound: u32) u32 {
             const va: @Vector(vl, u8) = @as(@Vector(vl, u8), a[i..][0..vl].*);
             const vb: @Vector(vl, u8) = @as(@Vector(vl, u8), b[i..][0..vl].*);
             const absdiff = @max(va, vb) - @min(va, vb);
-            const diff_arr: [vl]u8 = @bitCast(absdiff);
-            for (diff_arr) |d| {
-                dist += d;
-            }
+            // Zero-extend to u32 to avoid overflow in the horizontal sum
+            const widened: @Vector(vl, u32) = @intCast(absdiff);
+            dist += @reduce(.Add, widened);
 
-            if (dist > bound) return dist;
+            if (dist > bound) {
+                @branchHint(.unlikely);
+                return dist;
+            }
         }
 
         // Scalar tail
@@ -159,7 +283,10 @@ fn featureL1BoundedSimd(a: []const u8, b: []const u8, bound: u32) u32 {
             }
             dist += abs_d;
 
-            if (dist > bound) return dist;
+            if (dist > bound) {
+                @branchHint(.unlikely);
+                return dist;
+            }
         }
 
         return dist;
@@ -172,6 +299,8 @@ fn featureL1BoundedSimd(a: []const u8, b: []const u8, bound: u32) u32 {
 /// Compute L1 (sum of absolute differences) distance between two feature vectors.
 /// Returns the distance as u32, capped at maxInt(u32).
 pub fn featureL1(a: []const u8, b: []const u8) u32 {
+    @setRuntimeSafety(false);
+    defer @setRuntimeSafety(true);
     return featureL1Simd(a, b);
 }
 
@@ -183,7 +312,7 @@ pub fn featureL1Bounded(a: []const u8, b: []const u8, bound: u32) u32 {
 
 // ── Scalar fallbacks ──────────────────────────────────────────────────
 
-fn featureL1Scalar(a: []const u8, b: []const u8) u32 {
+inline fn featureL1Scalar(a: []const u8, b: []const u8) u32 {
     std.debug.assert(a.len == b.len);
 
     var dist: u32 = 0;
@@ -198,7 +327,7 @@ fn featureL1Scalar(a: []const u8, b: []const u8) u32 {
     return dist;
 }
 
-fn featureL1BoundedScalar(a: []const u8, b: []const u8, bound: u32) u32 {
+inline fn featureL1BoundedScalar(a: []const u8, b: []const u8, bound: u32) u32 {
     std.debug.assert(a.len == b.len);
 
     var dist: u32 = 0;
@@ -209,7 +338,10 @@ fn featureL1BoundedScalar(a: []const u8, b: []const u8, bound: u32) u32 {
             return std.math.maxInt(u32);
         }
         dist += abs_d;
-        if (dist > bound) return dist;
+        if (dist > bound) {
+            @branchHint(.unlikely);
+            return dist;
+        }
     }
     return dist;
 }
@@ -236,7 +368,7 @@ const TopKList = struct {
 
     /// Insert a candidate if it's better than the current worst.
     /// Maintains sorted order (ascending by distance).
-    fn insert(self: *TopKList, distance: u32, index: i32) void {
+    inline fn insert(self: *TopKList, distance: u32, index: i32) void {
         // Early exit if worse than current K-th best
         if (distance >= self.distances[K - 1]) return;
 
@@ -349,17 +481,15 @@ pub fn matchBatchCoarse(
     const use_threads = num_threads > 1 and num_targets > num_threads;
     const chunk_size = if (use_threads) (num_targets + num_threads - 1) / num_threads else 0;
 
+    // ── Thread pool (reused across coarse and fine stages) ──
+    var pool: ?ThreadPool = null;
+    if (use_threads) {
+        pool = try ThreadPool.init(allocator, @intCast(num_threads));
+    }
+    defer if (pool) |*p| p.deinit();
+
     // ── Coarse stage: parallel over target chunks ──
     if (use_threads) {
-        var handles = try allocator.alloc(std.Thread, num_threads);
-        defer {
-            var t: u32 = 0;
-            while (t < num_threads) : (t += 1) {
-                handles[t].join();
-            }
-            allocator.free(handles);
-        }
-
         var t: u32 = 0;
         while (t < num_threads) : (t += 1) {
             const start: u32 = @intCast(t * chunk_size);
@@ -379,7 +509,7 @@ pub fn matchBatchCoarse(
                 .end_target = end,
             };
 
-            handles[t] = try std.Thread.spawn(.{}, processCoarseChunk, .{ctx});
+            try pool.?.spawn(processCoarseChunk, .{ctx});
         }
     } else {
         var page_idx: u32 = 0;
@@ -399,18 +529,14 @@ pub fn matchBatchCoarse(
         }
     }
 
+    // Wait for coarse stage to complete before starting fine stage
+    if (use_threads) {
+        pool.?.wait();
+    }
+
     // ── Fine stage: parallel over target chunks ──
     if (fine_needed) {
         if (use_threads) {
-            var handles = try allocator.alloc(std.Thread, num_threads);
-            defer {
-                var t: u32 = 0;
-                while (t < num_threads) : (t += 1) {
-                    handles[t].join();
-                }
-                allocator.free(handles);
-            }
-
             var t: u32 = 0;
             while (t < num_threads) : (t += 1) {
                 const start: u32 = @intCast(t * chunk_size);
@@ -429,7 +555,7 @@ pub fn matchBatchCoarse(
                     .end_target = end,
                 };
 
-                handles[t] = try std.Thread.spawn(.{}, processFineChunk, .{ctx});
+                try pool.?.spawn(processFineChunk, .{ctx});
             }
         } else {
             var target_idx: u32 = 0;

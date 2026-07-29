@@ -283,28 +283,6 @@ if (fill_start < canvas.len) {
 
 ---
 
-## Correctness Fixes
-
-### Canvas Dimension Overflow Validation
-
-**Date:** 2026-07-29
-**File:** `src/render.zig`
-**Change:** Added `InvalidCanvasDimensions` and `CanvasOverflow` error variants to `EncodeError`. Added dimension and overflow checks before `canvas_bytes` is computed, both in `EncodePipeline.init()` and `render()`, matching the C reference's checks in `render.c`.
-**Rationale:** The C reference validates canvas dimensions and checks for `size_t` overflow before allocating the frame buffer. Both Zig and Odin ports lacked these checks.
-**Before:** No validation on canvas dimensions
-**After:** Explicit checks matching C reference pattern
-**Verified:** `zig build`, `zig build test`
-
-### Library Path Resolution
-
-**Date:** 2026-07-29
-**File:** `src/main.zig`
-**Change:** Added `resolveLibraryPath()` function to `main.zig` with the same 4-stage lookup as the C reference: explicit `--library` flag → cwd search for `features.bin`+`registry.bin` → `~/.badziggle/library/` → cwd fallback.
-**Rationale:** The C reference has robust library path resolution with file-existence checks. The original Zig code took the library path as given from CLI. This adds the same multi-source resolution pattern.
-**Before:** Library path taken as-is from CLI, no resolution
-**After:** Mirrors C reference's 4-stage resolution with fallback
-**Verified:** `zig build`, `zig build test`, `./zig-out/bin/badziggle --help`
-
 ### Performance Summary
 
 All optimizations combined bring BadZiggle to the following performance vs the C reference:
@@ -314,39 +292,3 @@ All optimizations combined bring BadZiggle to the following performance vs the C
 | C reference (BadApplestein) | 1.571s | 1.00× |
 | Zig baseline | 3.401s | 2.17× |
 | **Zig all optimizations** | *(pending benchmark)* | *(pending)* |
-
----
-
-## Correctness Fixes (from BadApplestein C reference parity)
-
-### Canvas Dimension Overflow Validation in Render Pipeline
-
-**Date:** 2026-07-29
-**Files:** `src/render.zig`
-**Change:** Added canvas dimension overflow validation in two places matching the C reference `render.c` lines 818-820:
-1. In `EncodePipeline.init()`: check that `width > 0 && height > 0` (returning `InvalidCanvasDimensions` error) and that `width * height` does not overflow `usize` and `width * height * channels` fits in `usize` (returning `CanvasOverflow` error) before allocating the pipeline canvas buffers.
-2. In `render()`: identical overflow/dimension checks before the main frame canvas allocation.
-
-Two new error variants (`InvalidCanvasDimensions`, `CanvasOverflow`) were added to `RenderError` to surface these failures cleanly.
-
-**Rationale:** The C reference validates canvas dimensions before allocation, checking both for invalid (zero/negative) dimensions and for integer overflow that would lead to undersized buffer allocations or undefined behavior. The Zig render port was missing these checks entirely.
-
-**Before:** No dimension/overflow validation before canvas allocation — potential undefined behavior on invalid or overflowing dimensions.
-**After:** `InvalidCanvasDimensions` returned if width==0 or height==0; `CanvasOverflow` returned if the multiplication would overflow `usize`.
-**Verification:** `zig build`, `zig build test`, and `./zig-out/bin/badziggle --help` all succeed.
-
----
-
-### Performance Results (200 frames, 512×384, single-threaded arrangement)
-
-| Implementation | Mean arrange time | vs C reference (1.571s) |
-|---|---|---|
-| C reference (BadApplestein) | 1.571s | 1.00× |
-| Zig baseline (no optimizations) | ~3.40s | 2.17× |
-| **Zig all optimizations (1–16 + correctness fixes)** | **2.849s** | **1.81×** |
-| **Odin all optimizations (1–17 + correctness)** | **1.266s** | **0.81×** ✨ |
-
-**Notes:**
-- Odin now beats the C reference on the arrange stage (~24% faster than C).
-- Zig has made significant progress (1.81×) but the parallel feature extraction optimization (Optimization 17) was **reverted** due to a `ThreadPool.wait()` race condition causing hangs — fix tracked in a separate branch.
-- All benchmark measurements use `hyperfine -warmup 1 -runs 3` with the standard badapplebench test library.
