@@ -9,10 +9,98 @@ const luma_b: u32 = 29;
 const luma_g: u32 = 150;
 const luma_r: u32 = 77;
 
+// ── SIMD-optimized BGR→grayscale ──────────────────────────────────
+// Mirrors BadApplestein's img_to_gray_simd (SSSE2/AVX2/NEON) using
+// portable std.simd.
+
+fn computeLuma5(bgr: @Vector(16, u8)) @Vector(5, u8) {
+    // B channel indices (pixels 0-4): byte offsets 0,3,6,9,12
+    const b_mask: @Vector(5, i32) = .{ 0, 3, 6, 9, 12 };
+    const g_mask: @Vector(5, i32) = .{ 1, 4, 7, 10, 13 };
+    const r_mask: @Vector(5, i32) = .{ 2, 5, 8, 11, 14 };
+
+    const b_ch = @shuffle(u8, bgr, undefined, b_mask);
+    const g_ch = @shuffle(u8, bgr, undefined, g_mask);
+    const r_ch = @shuffle(u8, bgr, undefined, r_mask);
+
+    // (29*B + 150*G + 77*R + 128) >> 8, saturating at 255.
+    var luma: [5]u8 = undefined;
+    inline for (0..5) |i| {
+        const val = @as(u32, b_ch[i]) * 29 + @as(u32, g_ch[i]) * 150 + @as(u32, r_ch[i]) * 77 + 128;
+        luma[i] = @intCast(@min(val >> 8, 255));
+    }
+    return @as(@Vector(5, u8), luma);
+}
+
+fn computeLuma10(bgr: @Vector(32, u8)) @Vector(10, u8) {
+    // B channel indices (pixels 0-9): byte offsets 0,3,6,...,27
+    const b_mask: @Vector(10, i32) = .{ 0, 3, 6, 9, 12, 15, 18, 21, 24, 27 };
+    const g_mask: @Vector(10, i32) = .{ 1, 4, 7, 10, 13, 16, 19, 22, 25, 28 };
+    const r_mask: @Vector(10, i32) = .{ 2, 5, 8, 11, 14, 17, 20, 23, 26, 29 };
+
+    const b_ch = @shuffle(u8, bgr, undefined, b_mask);
+    const g_ch = @shuffle(u8, bgr, undefined, g_mask);
+    const r_ch = @shuffle(u8, bgr, undefined, r_mask);
+
+    var luma: [10]u8 = undefined;
+    inline for (0..10) |i| {
+        const val = @as(u32, b_ch[i]) * 29 + @as(u32, g_ch[i]) * 150 + @as(u32, r_ch[i]) * 77 + 128;
+        luma[i] = @intCast(@min(val >> 8, 255));
+    }
+    return @as(@Vector(10, u8), luma);
+}
+
+/// SIMD-accelerated BGR→grayscale row conversion using std.simd.
+/// Processes `batch = suggestVectorLength(u8) / 3` pixels per SIMD iteration.
+fn imgToGraySimdRow(src_row: []const u8, dst_row: []u8, w: usize) void {
+    const opt_vl = std.simd.suggestVectorLength(u8);
+    if (opt_vl) |vl| {
+        const batch = vl / 3;
+        if (batch >= 4) {
+            var x: usize = 0;
+            if (batch == 5) {
+                while (x + 5 <= w) {
+                    const bgr = @as(@Vector(16, u8), @bitCast(src_row[x * 3 ..][0..16].*));
+                    const luma = computeLuma5(bgr);
+                    const luma_arr: [5]u8 = @bitCast(luma);
+                    @memcpy(dst_row[x .. x + 5], luma_arr[0..5]);
+                    x += 5;
+                }
+            } else if (batch == 10) {
+                while (x + 10 <= w) {
+                    const bgr = @as(@Vector(32, u8), @bitCast(src_row[x * 3 ..][0..32].*));
+                    const luma = computeLuma10(bgr);
+                    const luma_arr: [10]u8 = @bitCast(luma);
+                    @memcpy(dst_row[x .. x + 10], luma_arr[0..10]);
+                    x += 10;
+                }
+            }
+            // Scalar tail for remaining pixels.
+            while (x < w) {
+                const p = src_row[x * 3 ..][0..3];
+                const v = (luma_b * p[0] + luma_g * p[1] + luma_r * p[2] + 128) >> 8;
+                dst_row[x] = @intCast(@min(v, 255));
+                x += 1;
+            }
+            return;
+        }
+    }
+    // Scalar fallback when SIMD not available or batch < 4.
+    for (0..w) |i| {
+        const p = src_row[i * 3 ..][0..3];
+        const v = (luma_b * p[0] + luma_g * p[1] + luma_r * p[2] + 128) >> 8;
+        dst_row[i] = @intCast(@min(v, 255));
+    }
+}
+
 /// Convert an RGB/BGR Img to grayscale using Rec.601 luma.
+/// Uses SIMD-accelerated processing (SSSE2/AVX2 portable SIMD) when
+/// the target vector width allows batching of 4+ pixels per iteration.
 /// If src is already grayscale (channels==1), returns a copy.
 /// Caller owns the returned Img and must call deinit() on it.
 pub fn toGray(src: *const Img) !Img {
+    @setRuntimeSafety(false);
+    defer @setRuntimeSafety(true);
     if (src.channels == 1) {
         const dst = try Img.init(src.allocator, src.w, src.h, 1);
         @memcpy(dst.pixels, src.pixels[0 .. src.w * src.h]);
@@ -23,11 +111,9 @@ pub fn toGray(src: *const Img) !Img {
     for (0..src.h) |y| {
         const src_row_offset = y * src.stride;
         const dst_row_offset = y * @as(usize, dst.w);
-        for (0..src.w) |x| {
-            const p = src.pixels[src_row_offset + x * 3 ..][0..3];
-            const v = (luma_b * p[0] + luma_g * p[1] + luma_r * p[2] + 128) >> 8;
-            dst.pixels[dst_row_offset + x] = @intCast(@min(v, 255));
-        }
+        const src_row = src.pixels[src_row_offset ..][0 .. src.w * 3];
+        const dst_row = dst.pixels[dst_row_offset ..];
+        imgToGraySimdRow(src_row, dst_row, src.w);
     }
     return dst;
 }
@@ -36,6 +122,8 @@ pub fn toGray(src: *const Img) !Img {
 /// Uses box/area average per destination pixel (INTER_AREA-like).
 /// Caller owns the returned Img and must call deinit() on it.
 pub fn resizeArea(src: *const Img, nw: u32, nh: u32) !Img {
+    @setRuntimeSafety(false);
+    defer @setRuntimeSafety(true);
     const ch = src.channels;
     const sw = src.w;
     const sh = src.h;
@@ -94,9 +182,21 @@ pub fn resizeArea(src: *const Img, nw: u32, nh: u32) !Img {
                 var sum: u64 = 0;
                 var cy = sy0;
                 while (cy < sy1) : (cy += 1) {
+                    const row_offset = cy * src.stride + c;
                     var cx = sx0;
+                    if (ch == 1) {
+                        // SIMD: process 8 source columns at a time
+                        const vl = 8;
+                        var sum_vec: @Vector(vl, u64) = @splat(0);
+                        while (cx + vl <= sx1) : (cx += vl) {
+                            const pixels_vec: @Vector(vl, u8) = src.pixels[row_offset + cx ..][0..vl].*;
+                            const widened: @Vector(vl, u64) = @intCast(pixels_vec);
+                            sum_vec += widened;
+                        }
+                        sum += @reduce(.Add, sum_vec);
+                    }
                     while (cx < sx1) : (cx += 1) {
-                        sum += src.pixels[cy * src.stride + cx * ch + c];
+                        sum += src.pixels[row_offset + cx * ch];
                     }
                 }
                 const v: u32 = @intCast(sum / area);
@@ -143,35 +243,75 @@ pub fn integral(gray: []const u8, w: u32, h: u32, allocator: Allocator) ![]i64 {
 /// out: pre-allocated output buffer (w*h bytes).
 /// Border pixels are filled from nearest interior pixel.
 ///
-/// Uses pointer-based inner loops for better auto-vectorization
-/// by the compiler compared to index-based iteration.
+/// Uses explicit `@Vector` SIMD for the hot inner loop, processing
+/// 16 pixels per iteration (matching BadApplestein's AVX2/NEON path).
+/// The fast approximate magnitude avoids sqrt: max + min/2.
 pub fn sobelMagnitude(gray: []const u8, w: u32, h: u32, out: []u8) void {
-    // Interior pixels.
+    @setRuntimeSafety(false);
+    defer @setRuntimeSafety(true);
+    const vl: comptime_int = 16;
+    const two_splat: @Vector(vl, i32) = @splat(2);
+    const one_splat: @Vector(vl, i32) = @splat(1);
+    const max_val_splat: @Vector(vl, i32) = @splat(255);
+
+    // Interior pixels with SIMD when width allows.
     for (1..h - 1) |y| {
         const row_out = out[y * w ..];
         const row_top = gray[(y - 1) * w ..];
         const row_mid = gray[y * w ..];
         const row_bot = gray[(y + 1) * w ..];
 
-        // Pointers into each row for the inner loop.
         const top = row_top.ptr;
         const mid = row_mid.ptr;
         const bot = row_bot.ptr;
         const dst = row_out.ptr;
 
         var x: usize = 1;
-        while (x < w - 1) : (x += 1) {
-            const tl: i32 = top[x - 1];
-            const tc: i32 = top[x];
-            const tr: i32 = top[x + 1];
-            const ml: i32 = mid[x - 1];
-            const mr: i32 = mid[x + 1];
-            const bl: i32 = bot[x - 1];
-            const bc: i32 = bot[x];
-            const br: i32 = bot[x + 1];
 
-            const gx = -tl + tr - 2 * ml + 2 * mr - bl + br;
-            const gy = -tl - 2 * tc - tr + bl + 2 * bc + br;
+        // SIMD main loop: process 16 pixels per iteration.
+        if (w > vl + 1) {
+            while (x + vl <= w - 1) : (x += vl) {
+                const tl: @Vector(vl, i32) = @intCast(@as(@Vector(vl, u8), @bitCast(row_top[x - 1 ..][0..vl].*)));
+                const tc: @Vector(vl, i32) = @intCast(@as(@Vector(vl, u8), @bitCast(row_top[x ..][0..vl].*)));
+                const tr: @Vector(vl, i32) = @intCast(@as(@Vector(vl, u8), @bitCast(row_top[x + 1 ..][0..vl].*)));
+                const ml: @Vector(vl, i32) = @intCast(@as(@Vector(vl, u8), @bitCast(row_mid[x - 1 ..][0..vl].*)));
+                const mr: @Vector(vl, i32) = @intCast(@as(@Vector(vl, u8), @bitCast(row_mid[x + 1 ..][0..vl].*)));
+                const bl: @Vector(vl, i32) = @intCast(@as(@Vector(vl, u8), @bitCast(row_bot[x - 1 ..][0..vl].*)));
+                const bc: @Vector(vl, i32) = @intCast(@as(@Vector(vl, u8), @bitCast(row_bot[x ..][0..vl].*)));
+                const br: @Vector(vl, i32) = @intCast(@as(@Vector(vl, u8), @bitCast(row_bot[x + 1 ..][0..vl].*)));
+
+                // Gx = -tl + tr - 2*ml + 2*mr - bl + br
+                // Gy = -tl - 2*tc - tr + bl + 2*bc + br
+                const gx = -tl + tr - ml * two_splat + mr * two_splat - bl + br;
+                const gy = -tl - tc * two_splat - tr + bl + bc * two_splat + br;
+
+                const ax = @abs(gx);
+                const ay = @abs(gy);
+
+                // Fast approximate magnitude: max + min/2 (within 12% of true L2).
+                const mx = @max(ax, ay);
+                const mn = @min(ax, ay);
+                const mag = mx + (mn >> one_splat);
+
+                const clamped = @min(mag, max_val_splat);
+                const out_u8: @Vector(vl, u8) = @intCast(clamped);
+                row_out[x ..][0..vl].* = @as([vl]u8, @bitCast(out_u8));
+            }
+        }
+
+        // Scalar fallback for tail / narrow images.
+        while (x < w - 1) : (x += 1) {
+            const tli: i32 = @intCast(top[x - 1]);
+            const tci: i32 = @intCast(top[x]);
+            const tri: i32 = @intCast(top[x + 1]);
+            const mli: i32 = @intCast(mid[x - 1]);
+            const mri: i32 = @intCast(mid[x + 1]);
+            const bli: i32 = @intCast(bot[x - 1]);
+            const bci: i32 = @intCast(bot[x]);
+            const bri: i32 = @intCast(bot[x + 1]);
+
+            const gx = -tli + tri - 2 * mli + 2 * mri - bli + bri;
+            const gy = -tli - 2 * tci - tri + bli + 2 * bci + bri;
 
             const ax: u32 = @intCast(@abs(gx));
             const ay: u32 = @intCast(@abs(gy));

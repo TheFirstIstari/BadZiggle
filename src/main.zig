@@ -332,6 +332,7 @@ fn runRender(opts: types.Options, io: std.Io) !u8 {
         .fps = 0.0, // auto-detect from fps sidecar
         .max_frames = opts.max_frames,
         .channels = opts.channels,
+        .thread_count = opts.threads,
     };
 
     // Open the video encoder.
@@ -543,8 +544,8 @@ fn runBuild(opts: types.Options, sources_dir: []const u8, io: std.Io) !u8 {
         };
         defer img.deinit();
 
-        // Extract multi-resolution features.
-        const offset = @as(usize, i) * feat_len;
+        // Extract multi-resolution features, compacting past failed pages.
+        const offset = @as(usize, pages_done) * feat_len;
         imgops.computeFeatureMultires(
             &img,
             scales,
@@ -557,9 +558,9 @@ fn runBuild(opts: types.Options, sources_dir: []const u8, io: std.Io) !u8 {
             continue;
         };
 
-        // Registry entry: page_idx = i, pdf_path = source file name.
-        reg_entries[i] = .{
-            .page_idx = @intCast(i),
+        // Registry entry: use pages_done as write index for compaction.
+        reg_entries[pages_done] = .{
+            .page_idx = @intCast(pages_done),
             .pdf_path = try cli.g_allocator.dupe(u8, source_names.items[i]),
         };
 
@@ -685,7 +686,7 @@ fn cStrVectorToSlice(allocator: std.mem.Allocator, vec: []const [*:0]const u8) !
 }
 
 pub fn main(init: std.process.Init) u8 {
-    const allocator = std.heap.page_allocator;
+    const allocator = std.heap.smp_allocator;
     const io = init.io;
     cli.g_allocator = allocator;
     cli.init(allocator);

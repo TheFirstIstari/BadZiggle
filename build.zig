@@ -1,7 +1,9 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .cpu_model = .native },
+    });
 
     // Release mode options: --release-fast or --release-small
     const release_fast = b.option(bool, "release-fast", "Compile with ReleaseFast optimization") orelse false;

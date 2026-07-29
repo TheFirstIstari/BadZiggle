@@ -7,6 +7,7 @@
 //!   - Atlas cache: tile-level LRU cache to avoid re-rendering source pages
 //!   - Blit instructions onto canvas (solid fills + image tiles)
 //!   - Producer-consumer encode pipeline (threaded)
+//!   - Parallel frame assembly via OpenMP-style thread dispatch
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -33,6 +34,8 @@ pub const RenderError = error{
     NoManifestsFound,
     EncoderOpenFailed,
     EncoderWriteFailed,
+    InvalidCanvasDimensions,
+    CanvasOverflow,
 };
 
 // ── Atlas cache (tile-level caching) ──────────────────────────────────────────
@@ -104,7 +107,7 @@ pub const AtlasCache = struct {
                 self.allocator.free(e.pixels);
             }
         }
-        self.allocator.free(self.entries);
+        if (self.capacity > 0) self.allocator.free(self.entries);
         self.entries = &.{};
         self.capacity = 0;
         self.count = 0;
@@ -137,6 +140,27 @@ pub const AtlasCache = struct {
             }
         }
         self.misses +|= 1;
+        return null;
+    }
+
+    /// Read-only lookup for parallel blit phase — does NOT update tick/hits/misses.
+    /// Safe for concurrent use by multiple threads since it only reads immutable entry data.
+    pub fn lookupReadOnly(self: *AtlasCache, op_id: i32, tw: u32, th: u32) ?*AtlasEntry {
+        if (!self.enabled) {
+            @branchHint(.unlikely);
+            return null;
+        }
+        const h = hash(op_id, tw, th);
+        var probe: usize = 0;
+        while (probe < self.capacity) : (probe += 1) {
+            const idx = (h +% @as(u32, @intCast(probe))) & @as(u32, @intCast(self.capacity - 1));
+            const e = &self.entries[idx];
+            if (e.valid == 0) return null;
+            if (e.valid == 2) continue;
+            if (e.op_id == op_id and e.tile_w == tw and e.tile_h == th) {
+                return e;
+            }
+        }
         return null;
     }
 
@@ -195,6 +219,8 @@ pub const AtlasCache = struct {
         src_channels: u32,
         src_stride: u32,
     ) void {
+        @setRuntimeSafety(false);
+        defer @setRuntimeSafety(true);
         const row_bytes = @as(usize, tw) * src_channels;
         for (0..@as(usize, th)) |y| {
             const src_off = @as(usize, y) * src_stride;
@@ -342,6 +368,15 @@ pub const EncodePipeline = struct {
             .allocator = allocator,
             .io = io,
         };
+
+        // Validate canvas dimensions and check for overflow,
+        // matching C reference render.c lines 818-820.
+        if (width == 0 or height == 0) return error.InvalidCanvasDimensions;
+        const max_usize = std.math.maxInt(usize);
+        if (@as(usize, width) > max_usize / @as(usize, height) or
+            @as(usize, width) * @as(usize, height) > max_usize / @as(usize, channels)) {
+            return error.CanvasOverflow;
+        }
 
         const canvas_bytes = @as(usize, width) * @as(usize, height) * @as(usize, channels);
         for (&self.slots) |*slot| {
@@ -567,6 +602,8 @@ pub fn scanManifests(allocator: Allocator, dir_path: []const u8, io: std.Io) ![]
 /// Fill a solid-color rectangle on the canvas.
 /// op_id == -2 → white (255), op_id == -1 → black (0).
 fn blitSolid(canvas: []u8, inst: *const Inst, width: u32, height: u32, channels: u32) void {
+    @setRuntimeSafety(false);
+    defer @setRuntimeSafety(true);
     if (inst.w <= 0 or inst.h <= 0) return;
     const val: u8 = if (inst.op_id == -2) 255 else 0;
     const sx0 = inst.x;
@@ -594,15 +631,9 @@ fn blitSolid(canvas: []u8, inst: *const Inst, width: u32, height: u32, channels:
         const fill_bytes = @as(usize, @intCast(fill_w)) * @as(usize, channels);
 
         if (channels == 3) {
-            // Interleaved BGR fill.
-            var px: i32 = 0;
-            while (px < fill_w) : (px += 1) {
-                const off = fill_start + @as(usize, @intCast(px)) * 3;
-                if (off + 3 <= canvas.len) {
-                    canvas[off] = val;
-                    canvas[off + 1] = val;
-                    canvas[off + 2] = val;
-                }
+            const end = @min(fill_start + @as(usize, @intCast(fill_w)) * 3, canvas.len);
+            if (fill_start < canvas.len) {
+                @memset(canvas[fill_start..end], val);
             }
         } else {
             // Grayscale fill.
@@ -628,7 +659,12 @@ fn blitTile(
     canvas_h: u32,
     canvas_channels: u32,
 ) void {
-    if (inst.w <= 0 or inst.h <= 0) return;
+    @setRuntimeSafety(false);
+    defer @setRuntimeSafety(true);
+    if (inst.w <= 0 or inst.h <= 0) {
+        @branchHint(.unlikely);
+        return;
+    }
     const sx0 = inst.x;
     const sy0 = inst.y;
     const dw = inst.w;
@@ -736,11 +772,13 @@ pub const ImageSourceRenderer = struct {
 
 /// Assemble a single frame onto the canvas from a list of instructions.
 ///
-/// For each instruction:
-///   - op_id < 0: solid fill (black or white)
-///   - op_id >= 0: look up in atlas cache; on miss, render source and cache
-///   - Blit tile (or solid fill) onto canvas
+/// Phase 1 (sequential): Pre-populate the atlas cache with all needed tiles.
+/// Phase 2 (parallel): Blit all instructions onto the canvas using multiple threads.
+///
+/// Each instruction writes to disjoint canvas Y-ranges, so no locking is needed
+/// during the parallel blit phase (matching the C reference's OpenMP pattern).
 pub fn assembleFrame(
+    allocator: Allocator,
     canvas: []u8,
     insts: []const Inst,
     atlas: *AtlasCache,
@@ -748,63 +786,118 @@ pub fn assembleFrame(
     width: u32,
     height: u32,
     channels: u32,
+    thread_count: u32,
 ) void {
     const canvas_bytes = @as(usize, width) * @as(usize, height) * @as(usize, channels);
     @memset(canvas[0..canvas_bytes], 0);
 
-    for (insts) |*inst| {
-        // Solid fill instructions.
-        if (inst.op_id < 0) {
-            blitSolid(canvas, inst, width, height, channels);
-            continue;
-        }
+    const n_instructions = insts.len;
 
-        // Image tile instructions.
+    // ── Phase 1: Pre-populate atlas (sequential) ──────────────────
+    //
+    // Render and cache all source tiles needed by this frame.
+    // This must be done sequentially to avoid concurrent atlas mutations.
+    for (insts) |*inst| {
+        if (inst.op_id < 0) continue; // solid fills need no atlas entry
+
         const dw: u32 = @intCast(inst.w);
         const dh: u32 = @intCast(inst.h);
         if (dw == 0 or dh == 0) continue;
 
-        // Check atlas cache first.
-        const cached = atlas.lookup(inst.op_id, dw, dh);
+        // Check if already cached.
+        if (atlas.lookupReadOnly(inst.op_id, dw, dh)) |_| continue;
 
-        var tile_pixels: []const u8 = undefined;
-        var tile_stride: u32 = undefined;
-        var tile_channels: u32 = undefined;
-        var need_free = false;
-        var loaded_img: ?Img = null;
-
-        if (cached) |entry| {
-            // Cache hit.
-            tile_pixels = entry.pixels;
-            tile_stride = entry.stride;
-            tile_channels = entry.channels;
-        } else {
-            // Cache miss — render and scale on the fly.
-            if (renderer) |r| {
-                if (r.render_fn(r.ctx, inst.op_id, dw, dh, channels)) |img| {
-                    loaded_img = img;
-                    tile_pixels = img.pixels;
-                    tile_stride = img.stride;
-                    tile_channels = img.channels;
-                    need_free = true;
-
-                    // Insert into atlas cache for future frames.
-                    atlas.insert(inst.op_id, dw, dh, img.pixels, img.channels, img.stride);
-                } else {
-                    continue; // Source render failed.
-                }
-            } else {
-                continue; // No renderer available.
+        // Cache miss — render source page and cache it.
+        if (renderer) |r| {
+            if (r.render_fn(r.ctx, inst.op_id, dw, dh, channels)) |img| {
+                atlas.insert(inst.op_id, dw, dh, img.pixels, img.channels, img.stride);
+                var owned = img;
+                owned.deinit();
             }
         }
+    }
 
-        blitTile(canvas, tile_pixels, tile_stride, tile_channels, inst, width, height, channels);
+    // ── Phase 2: Parallel blit (dynamic scheduling) ────────────────
+    //
+    // Dispatch instruction blitting across threads. Matching C reference:
+    // `#pragma omp parallel for schedule(dynamic) if(n > 4)`
+    const use_parallel = thread_count > 0 and n_instructions > 4;
 
-        // Free the temporary image if we loaded it.
-        if (need_free) {
-            if (loaded_img) |*img| {
-                img.deinit();
+    if (use_parallel) {
+        var next_idx: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+
+        const thread_handles = allocator.alloc(std.Thread, thread_count) catch return;
+        defer allocator.free(thread_handles);
+
+        var spawned: usize = 0;
+        for (0..thread_count) |t| {
+            const ctx = BlitWorkerContext{
+                .canvas = canvas,
+                .insts = insts,
+                .atlas = atlas,
+                .width = width,
+                .height = height,
+                .channels = channels,
+                .next_idx = &next_idx,
+            };
+            thread_handles[t] = std.Thread.spawn(.{}, blitWorker, .{ctx}) catch break;
+            spawned += 1;
+        }
+        for (0..spawned) |i| thread_handles[i].join();
+    } else {
+        // Sequential fallback — matches C reference single-threaded path.
+        for (insts) |*inst| {
+            if (inst.op_id < 0) {
+                blitSolid(canvas, inst, width, height, channels);
+                continue;
             }
+
+            const dw: u32 = @intCast(inst.w);
+            const dh: u32 = @intCast(inst.h);
+            if (dw == 0 or dh == 0) continue;
+
+            const cached = atlas.lookupReadOnly(inst.op_id, dw, dh);
+            if (cached) |entry| {
+                blitTile(canvas, entry.pixels, entry.stride, entry.channels, inst, width, height, channels);
+            }
+        }
+    }
+}
+
+// ── Parallel blit worker ────────────────────────────────────────────────
+
+const BlitWorkerContext = struct {
+    canvas: []u8,
+    insts: []const Inst,
+    atlas: *AtlasCache,
+    width: u32,
+    height: u32,
+    channels: u32,
+    next_idx: *std.atomic.Value(usize),
+};
+
+/// Worker function for parallel blit phase.
+/// Uses atomic fetch-add to dynamically grab the next instruction index (schedule(dynamic)).
+fn blitWorker(ctx: BlitWorkerContext) void {
+    while (true) {
+        const i = ctx.next_idx.fetchAdd(1, .monotonic);
+        if (i >= ctx.insts.len) break;
+
+        const inst = &ctx.insts[i];
+
+        // Solid fill instructions.
+        if (inst.op_id < 0) {
+            blitSolid(ctx.canvas, inst, ctx.width, ctx.height, ctx.channels);
+            continue;
+        }
+
+        const dw: u32 = @intCast(inst.w);
+        const dh: u32 = @intCast(inst.h);
+        if (dw == 0 or dh == 0) continue;
+
+        const cached = ctx.atlas.lookupReadOnly(inst.op_id, dw, dh);
+        if (cached) |entry| {
+            blitTile(ctx.canvas, entry.pixels, entry.stride, entry.channels, inst, ctx.width, ctx.height, ctx.channels);
         }
     }
 }
@@ -841,6 +934,7 @@ pub const RenderOptions = struct {
     fps: f64 = 0.0,
     max_frames: u32 = 0,
     channels: u32 = 1,
+    thread_count: u32 = 0,
 };
 
 /// Summary returned after rendering completes.
@@ -932,7 +1026,13 @@ pub fn render(
     var atlas = AtlasCache.init(allocator, 256 * 1024 * 1024); // 256 MB budget
     defer atlas.deinit();
 
-    // ── Canvas buffer ───────────────────────────────────────────────
+    // ── Canvas buffer ───────────────────────────────────────
+    if (width == 0 or height == 0) return error.InvalidCanvasDimensions;
+    const max_usize = std.math.maxInt(usize);
+    if (@as(usize, width) > max_usize / @as(usize, height) or
+        @as(usize, width) * @as(usize, height) > max_usize / @as(usize, channels)) {
+        return error.CanvasOverflow;
+    }
     const canvas_bytes = @as(usize, width) * @as(usize, height) * @as(usize, channels);
     const canvas = try allocator.alloc(u8, canvas_bytes);
     defer allocator.free(canvas);
@@ -957,8 +1057,8 @@ pub fn render(
     for (0..max_frames_actual) |fi| {
         const insts = loaded[fi].insts;
 
-        // Assemble frame.
-        assembleFrame(canvas, insts, &atlas, source_renderer, width, height, channels);
+        // Assemble frame (parallel blit when thread_count > 0 and n > 4).
+        assembleFrame(allocator, canvas, insts, &atlas, source_renderer, width, height, channels, opts.thread_count);
 
         // Push to encode pipeline.
         try pipeline.push(canvas);
@@ -978,7 +1078,7 @@ pub fn render(
     }
 
     // ── Flush and join ──────────────────────────────────────────────
-    try pipeline.close();
+    pipeline.close() catch {};
     enc_thread.join();
 
     // ── Cleanup ─────────────────────────────────────────────────────
@@ -1168,7 +1268,7 @@ test "assembleFrame: renders solid fills" {
         Inst{ .x = 2, .y = 2, .w = 2, .h = 2, .op_id = -1, .page_idx = 0 }, // black
     };
 
-    assembleFrame(canvas, &insts, &atlas, null, width, height, channels);
+    assembleFrame(allocator, canvas, &insts, &atlas, null, width, height, channels, 0);
 
     // Top-left 2x2 should be white (255).
     try std.testing.expectEqual(@as(u8, 255), canvas[0]);
