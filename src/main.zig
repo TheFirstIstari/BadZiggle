@@ -7,7 +7,7 @@ const match = @import("match.zig");
 const render = @import("render.zig");
 const imgops = @import("imgops.zig");
 
-const VERSION = "0.1.0";
+const VERSION = "1.0.0";
 
 fn nowNanos() u64 {
     var ts: std.c.timespec = undefined;
