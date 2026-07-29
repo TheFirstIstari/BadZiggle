@@ -334,3 +334,19 @@ Two new error variants (`InvalidCanvasDimensions`, `CanvasOverflow`) were added 
 **Before:** No dimension/overflow validation before canvas allocation — potential undefined behavior on invalid or overflowing dimensions.
 **After:** `InvalidCanvasDimensions` returned if width==0 or height==0; `CanvasOverflow` returned if the multiplication would overflow `usize`.
 **Verification:** `zig build`, `zig build test`, and `./zig-out/bin/badziggle --help` all succeed.
+
+---
+
+### Performance Results (200 frames, 512×384, single-threaded arrangement)
+
+| Implementation | Mean arrange time | vs C reference (1.571s) |
+|---|---|---|
+| C reference (BadApplestein) | 1.571s | 1.00× |
+| Zig baseline (no optimizations) | ~3.40s | 2.17× |
+| **Zig all optimizations (1–16 + correctness fixes)** | **2.849s** | **1.81×** |
+| **Odin all optimizations (1–17 + correctness)** | **1.266s** | **0.81×** ✨ |
+
+**Notes:**
+- Odin now beats the C reference on the arrange stage (~24% faster than C).
+- Zig has made significant progress (1.81×) but the parallel feature extraction optimization (Optimization 17) was **reverted** due to a `ThreadPool.wait()` race condition causing hangs — fix tracked in a separate branch.
+- All benchmark measurements use `hyperfine -warmup 1 -runs 3` with the standard badapplebench test library.
