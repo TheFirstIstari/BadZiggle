@@ -12,6 +12,7 @@
 /// management.
 
 const std = @import("std");
+const cli = @import("cli.zig");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const Img = types.Img;
@@ -479,6 +480,7 @@ pub const Arranger = struct {
         var feat_bufs = try frame_allocator.alloc(u8, feat_bufs_len);
 
         // ── Phase 3: Coarse cache check + full feature extraction ───
+
         // Ensure coarse_hit buffer.
         if (self.bufs.coarse_hit == null or self.bufs.coarse_hit.?.len < n_specs) {
             if (self.bufs.coarse_hit) |ch| self.allocator.free(ch);
@@ -610,6 +612,7 @@ pub const Arranger = struct {
             }
         }
 
+
         // ── Phase 4: Full-cache lookup for remaining tiles ───────────
         self.miss_idx.clearRetainingCapacity();
 
@@ -628,6 +631,7 @@ pub const Arranger = struct {
                 try tiles_buf.appendSlice(frame_allocator, feat);
             }
         }
+
 
         // ── Phase 5: Batch match + cache_put ─────────────────────────
         if (self.miss_idx.items.len > 0) {
@@ -666,6 +670,7 @@ pub const Arranger = struct {
                 }
             }
 
+
             const results = try match_mod.matchBatchCoarse(
                 frame_allocator,
                 db.data,
@@ -675,6 +680,7 @@ pub const Arranger = struct {
                 @intCast(feat_len),
                 coarse_for_match,
             );
+
             defer frame_allocator.free(results);
 
             for (dedup_map, 0..) |dup_idx, i| {
@@ -691,6 +697,7 @@ pub const Arranger = struct {
 
             t.match_time += 0; // TODO: would need timer
             t.tiles += nt;
+
         }
     }
 
@@ -718,13 +725,15 @@ pub const Arranger = struct {
         errdefer manifest.deinit(self.allocator);
 
         var tiles_buf: std.ArrayList(u8) = .empty;
-        // tiles_buf is allocated from the arena (aa); arena.deinit() handles cleanup.
+
 
         var specs = try self.solveGreedy(gray, w, h, &manifest);
         defer specs.deinit(self.allocator);
 
+
         // Pre-size tiles_buf to avoid reallocations during miss collection.
         try tiles_buf.ensureTotalCapacityPrecise(aa, specs.items.len * db.feat_len);
+
 
         try self.extractAndMatch(
             aa,
@@ -740,6 +749,7 @@ pub const Arranger = struct {
             &tiles_buf,
             t,
         );
+
 
         return manifest;
     }

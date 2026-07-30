@@ -159,8 +159,9 @@ pub fn parse(args: []const []const u8) void {
                 g_ctx.quiet = true;
                 continue;
             }
-            if (first_c == 'j' and rest.len == 4 and std.mem.eql(u8, rest, "json")) {
-                g_ctx.json = true;
+            // Check multi-scale flag (--multi-scale)
+            if (std.mem.eql(u8, rest, "multi-scale")) {
+                store("multi-scale", "1");
                 continue;
             }
 
@@ -305,7 +306,6 @@ pub fn jsonEnd() void {
 
 pub fn buildOptions() Options {
     return Options{
-        .input = optStr("input", ""),
         .output = optStr("output", ""),
         .video = optStr("video", ""),
         .features = optStr("features", ""),
@@ -313,16 +313,18 @@ pub fn buildOptions() Options {
         .manifests = optStr("manifests", ""),
         .library = optStr("library", ""),
         .preset = optStr("preset", ""),
-        .width = @intCast(optInt("width", 1920)),
-        .height = @intCast(optInt("height", 1080)),
+        .width = @intCast(optInt("width", 0)),
+        .height = @intCast(optInt("height", 0)),
         .max_frames = @intCast(optInt("max-frames", 0)),
         .threads = g_ctx.threads,
         .bits = @intCast(optInt("bits", 1)),
         .no_edges = optBool("no-edges", false),
         .color = optBool("color", false),
+        .multi_scale = optBool("multi-scale", false),
         .scales = parseScales(g_allocator, optStr("scales", "")),
         .channels = @intCast(optInt("channels", 1)),
         .verbose = g_ctx.verbose,
+        .fps = optFloat("fps", 0.0),
     };
 }
 

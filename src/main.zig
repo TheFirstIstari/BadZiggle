@@ -7,7 +7,7 @@ const match = @import("match.zig");
 const render = @import("render.zig");
 const imgops = @import("imgops.zig");
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 
 fn nowNanos() u64 {
     var ts: std.c.timespec = undefined;
@@ -30,6 +30,9 @@ fn printHelp() void {
     cli.info("  build    — build source library (features.bin + registry.bin) from PDFs/images", .{});
     cli.info("  <input> <output>  (shorthand for arrange+render pipeline)", .{});
     cli.info("", .{});
+    cli.info("Options:", .{});
+    cli.info("  --library <dir>      Library directory (default: ./ or ~/.badziggle/library/)", .{});
+    cli.info("", .{});
     cli.info("Run 'badziggle <command> --help' for command-specific options.", .{});
 }
 
@@ -43,6 +46,7 @@ fn printArrangeHelp() void {
     cli.info("  --video <file>         Input video file (required)", .{});
     cli.info("  --features <file>      Feature database (default: features.bin)", .{});
     cli.info("  --registry <file>      Registry (default: registry.bin)", .{});
+    cli.info("  --library <dir>        Library directory (default: ./ or ~/.badziggle/library/)", .{});
     cli.info("  --manifests <dir>      Manifest output directory (default: manifests_greedy)", .{});
     cli.info("  --max-block-pct <N>    Maximum block size as percentage of frame (default: auto)", .{});
     cli.info("  --hero-min-pct <N>     Minimum hero block size as percentage of frame (default: auto)", .{});
@@ -62,12 +66,16 @@ fn printRenderHelp() void {
     cli.info("Options:", .{});
     cli.info("  --manifests <dir>      Manifest directory (default: manifests_greedy)", .{});
     cli.info("  --registry <file>      Registry (default: registry.bin)", .{});
+    cli.info("  --library <dir>        Library directory (default: ./ or ~/.badziggle/library/)", .{});
     cli.info("  --output <file>        Output video (default: output.mov)", .{});
     cli.info("  --width <N>            Output width (overrides preset)", .{});
     cli.info("  --height <N>           Output height (overrides preset)", .{});
     cli.info("  --fps <N>              Output FPS (overrides preset)", .{});
     cli.info("  --preset <name>        Resolution preset: 8k, 4k, 1080p, 720p", .{});
     cli.info("  --channels <N>         1=grayscale, 3=color (default: 1)", .{});
+    cli.info("  --codec <name>         FFmpeg encoder (default: auto-detect)", .{});
+    cli.info("  --pix-fmt <name>       Pixel format (default: auto from codec)", .{});
+    cli.info("  --no-hw                Disable hardware encoder, force software", .{});
     cli.info("  --max-frames <N>       Maximum frames to render (0 = all)", .{});
     cli.info("  --threads <N>          Thread count (0 = auto)", .{});
     cli.info("  --verbose, -v          Verbose output", .{});
@@ -86,6 +94,9 @@ fn printBuildHelp() void {
     cli.info("  --no-edges             Disable edge detection features", .{});
     cli.info("  --color                Include BGR color features", .{});
     cli.info("  --scales <list>        Comma-separated scale levels (default: 32,64,128)", .{});
+    cli.info("  --no-edges             Disable edge detection features", .{});
+    cli.info("  --library <dir>        Library output directory (default: ./)", .{});
+    cli.info("  --multi-scale          Emit 0.5x, 1.0x, 1.5x, 2.0x render variants per source", .{});
     cli.info("  --out <file>           Output features file (default: features.bin)", .{});
     cli.info("  --threads <N>          Thread count (0 = auto)", .{});
     cli.info("  --verbose, -v          Verbose output", .{});
@@ -237,10 +248,13 @@ fn runArrange(opts: *types.Options, io: std.Io) !u8 {
     while (true) {
         if (opts.max_frames > 0 and frame_idx >= opts.max_frames) break;
 
+
         const result = decoder.next() catch |err| {
+
             cli.err("decode error at frame {d}: {}", .{ frame_idx, err });
             break;
         };
+
 
         switch (result) {
             .end_of_stream => break,
@@ -249,13 +263,16 @@ fn runArrange(opts: *types.Options, io: std.Io) !u8 {
                 defer bgr_img.deinit();
 
                 // Convert to grayscale for the solver.
+
                 var gray_img = imgops.toGray(&bgr_img) catch |err| {
                     cli.err("toGray failed at frame {d}: {}", .{ frame_idx, err });
                     break;
                 };
                 defer gray_img.deinit();
 
+
                 // Process the frame through the arrange pipeline.
+
                 var manifest = arranger.processFrame(
                     gray_img.pixels,
                     bgr_img.pixels,
@@ -269,6 +286,7 @@ fn runArrange(opts: *types.Options, io: std.Io) !u8 {
                     cli.err("processFrame failed at frame {d}: {}", .{ frame_idx, err });
                     break;
                 };
+
                 defer manifest.deinit(cli.g_allocator);
 
                 // Write the manifest file.
@@ -329,7 +347,7 @@ fn runRender(opts: types.Options, io: std.Io) !u8 {
         .output = output,
         .width = @intCast(opts.width),
         .height = @intCast(opts.height),
-        .fps = 0.0, // auto-detect from fps sidecar
+        .fps = opts.fps, // use --fps flag; auto-detected from fps.bin sidecar when 0
         .max_frames = opts.max_frames,
         .channels = opts.channels,
         .thread_count = opts.threads,
@@ -339,34 +357,101 @@ fn runRender(opts: types.Options, io: std.Io) !u8 {
     const output_z = try toNullTerminated(cli.g_allocator, output);
     defer cli.g_allocator.free(output_z);
 
-    const width: u32 = if (opts.width > 0) opts.width else 7680;
-    const height: u32 = if (opts.height > 0) opts.height else 4320;
+    // Auto-detect source dimensions from first manifest header to configure encoder.
+    // Manifest binary format: first 8 bytes are src_w (u32 LE) + src_h (u32 LE).
+    var enc_width: u32 = 0;
+    var enc_height: u32 = 0;
+    {
+        if (render.scanManifests(cli.g_allocator, manifest_dir, io)) |manifest_paths| {
+            defer {
+                for (manifest_paths) |p| cli.g_allocator.free(p);
+                cli.g_allocator.free(manifest_paths);
+            }
+            if (manifest_paths.len > 0) {
+                if (std.Io.Dir.cwd().readFileAlloc(io, manifest_paths[0], cli.g_allocator, .limited(8))) |data| {
+                    defer cli.g_allocator.free(data);
+                    if (data.len >= 8) {
+                        const src_w = std.mem.readInt(u32, data[0..4], .little);
+                        const src_h = std.mem.readInt(u32, data[4..8], .little);
+                        if (opts.width > 0 and opts.height > 0) {
+                            enc_width = opts.width;
+                            enc_height = opts.height;
+                        } else if (opts.width > 0 and opts.height == 0) {
+                            enc_width = opts.width;
+                            if (src_w > 0 and src_h > 0) {
+                                enc_height = @intFromFloat(@as(f64, @floatFromInt(opts.width)) * @as(f64, @floatFromInt(src_h)) / @as(f64, @floatFromInt(src_w)) + 0.5);
+                            } else {
+                                enc_height = 4320;
+                            }
+                        } else if (opts.width == 0 and opts.height > 0) {
+                            enc_height = opts.height;
+                            if (src_w > 0 and src_h > 0) {
+                                enc_width = @intFromFloat(@as(f64, @floatFromInt(opts.height)) * @as(f64, @floatFromInt(src_w)) / @as(f64, @floatFromInt(src_h)) + 0.5);
+                            } else {
+                                enc_width = 7680;
+                            }
+                        } else {
+                            if (src_w > 0 and src_h > 0) {
+                                enc_width = src_w;
+                                enc_height = src_h;
+                            } else {
+                                enc_width = 7680;
+                                enc_height = 4320;
+                            }
+                        }
+                    }
+                } else |_| {}
+            }
+        } else |_| {}
+    }
+    if (enc_width == 0) enc_width = if (opts.width > 0) opts.width else 7680;
+    if (enc_height == 0) enc_height = if (opts.height > 0) opts.height else 4320;
+
+    const width = enc_width;
+    const height = enc_height;
     const channels = if (opts.channels == 3) @as(u32, 3) else @as(u32, 1);
 
     // Determine codec: try hardware first, fall back to software ProRes.
+    // Honor user-provided --codec and --pix-fmt overrides when set.
+    const user_codec_str = cli.optStr("codec", "");
+    const user_pix_fmt_str = cli.optStr("pix-fmt", "");
+    const no_hw = cli.has("no-hw");
+
     const hw_codec = video.probeHwEncoder();
-    const use_hw = hw_codec != null and !cli.has("no-hw");
+    const use_hw = hw_codec != null and !no_hw;
 
     // Resolve pix_fmt and codec name.
     var pix_fmt_name: [*:0]const u8 = "gray";
     var codec_name: ?[*:0]const u8 = null;
 
+    // Convert user overrides to null-terminated strings for FFmpeg if provided.
+    const codec_override_z: ?[:0]const u8 = if (user_codec_str.len > 0)
+        try toNullTerminated(cli.g_allocator, user_codec_str)
+    else
+        null;
+    const pix_fmt_override_z: ?[:0]const u8 = if (user_pix_fmt_str.len > 0)
+        try toNullTerminated(cli.g_allocator, user_pix_fmt_str)
+    else
+        null;
+    defer if (codec_override_z) |c| cli.g_allocator.free(c);
+    defer if (pix_fmt_override_z) |p| cli.g_allocator.free(p);
+
     if (channels == 3) {
         if (use_hw) {
             if (hw_codec) |hw| {
                 codec_name = hw;
-                pix_fmt_name = "yuv420p";
+                pix_fmt_name = if (pix_fmt_override_z != null) pix_fmt_override_z.?.ptr else "yuv420p";
                 cli.info("hw encoder: {s}", .{std.mem.span(hw)});
             }
         } else {
-            codec_name = "prores_ks";
-            pix_fmt_name = "yuv422p10le";
-            cli.info("sw encoder: prores_ks", .{});
+            codec_name = if (codec_override_z != null) codec_override_z.?.ptr else "prores_ks";
+            pix_fmt_name = if (pix_fmt_override_z != null) pix_fmt_override_z.?.ptr else "yuv422p10le";
+            cli.info("sw encoder: {s}", .{codec_name.?});
         }
     }
 
     const src_fps = render.readFpsFile(cli.g_allocator, manifest_dir, io);
-    const encoder_fps = if (src_fps > 0.0) src_fps else 30.0;
+    const encoder_fps = if (opts.fps > 0.0) opts.fps else if (src_fps > 0.0) src_fps else 30.0;
 
     var encoder = video.VideoEncoder.open(
         cli.g_allocator,
@@ -593,9 +678,60 @@ fn runBuild(opts: types.Options, sources_dir: []const u8, io: std.Io) !u8 {
     return 0;
 }
 
-/// Detect source video dimensions and fps to auto-set output width/height.
-fn autoDetectSource(video_path: []const u8, opts: *types.Options) void {
-    _ = video_path;
+/// Detect source video dimensions from the first manifest file header.
+/// Reads src_w/src_h from the manifest binary header (first 8 bytes: u32 LE)
+/// and computes output dimensions preserving source aspect ratio:
+///   - neither specified → source dimensions
+///   - width only → height = width * src_h / src_w
+///   - height only → width = height * src_w / src_h
+fn autoDetectSource(manifest_dir: []const u8, opts: *types.Options, io: std.Io, allocator: std.mem.Allocator) void {
+    var src_w: u32 = 0;
+    var src_h: u32 = 0;
+    if (render.scanManifests(allocator, manifest_dir, io)) |manifest_paths| {
+        defer {
+            for (manifest_paths) |p| allocator.free(p);
+            allocator.free(manifest_paths);
+        }
+        if (manifest_paths.len > 0) {
+            if (std.Io.Dir.cwd().readFileAlloc(io, manifest_paths[0], allocator, .limited(8))) |data| {
+                defer allocator.free(data);
+                if (data.len >= 8) {
+                    src_w = std.mem.readInt(u32, data[0..4], .little);
+                    src_h = std.mem.readInt(u32, data[4..8], .little);
+                }
+            } else |_| {}
+        }
+    } else |_| {}
+    // ── Auto-detect dimensions from source aspect ratio ──
+    // Mirror BadApplestein's render.c (lines 686-724).
+    if (src_w > 0 and src_h > 0) {
+        const src_aspect: f64 = @as(f64, @floatFromInt(src_w)) / @as(f64, @floatFromInt(src_h));
+        if (opts.width == 0 and opts.height == 0) {
+            // Neither specified: match source resolution
+            opts.width = src_w;
+            opts.height = src_h;
+        } else if (opts.width > 0 and opts.height == 0) {
+            // Width only: compute height from aspect ratio, rounded to even
+            opts.height = @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(opts.width)) / src_aspect)));
+            opts.height = (opts.height / 2) * 2;
+        } else if (opts.height > 0 and opts.width == 0) {
+            // Height only: compute width from aspect ratio, rounded to even
+            opts.width = @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(opts.height)) * src_aspect)));
+            opts.width = (opts.width / 2) * 2;
+        } else {
+            // Both specified: fit within bounding box preserving aspect
+            const dst_aspect: f64 = @as(f64, @floatFromInt(opts.width)) / @as(f64, @floatFromInt(opts.height));
+            if (dst_aspect > src_aspect) {
+                // Output wider than source → shrink width
+                opts.width = @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(opts.height)) * src_aspect)));
+                opts.width = (opts.width / 2) * 2;
+            } else {
+                // Output taller than source → shrink height
+                opts.height = @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(opts.width)) / src_aspect)));
+                opts.height = (opts.height / 2) * 2;
+            }
+        }
+    }
     if (opts.width == 0) opts.width = 1920;
     if (opts.height == 0) opts.height = 1080;
 }
@@ -733,7 +869,8 @@ pub fn main(init: std.process.Init) u8 {
             printRenderHelp();
             return 0;
         }
-        const opts = cli.buildOptions();
+        var opts = cli.buildOptions();
+        _ = expandPreset(&opts);
         return runRender(opts, io) catch 1;
     }
 
@@ -793,6 +930,7 @@ pub fn main(init: std.process.Init) u8 {
             cli.info("badziggle shorthand encode: {s} -> {s}", .{ cmd, output_arg });
 
             var opts = cli.buildOptions();
+            _ = expandPreset(&opts);
             opts.video = cmd;
             opts.output = output_arg;
             resolveLibraryPath(&opts);

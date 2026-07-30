@@ -967,10 +967,6 @@ pub fn render(
     encoder: ?*EncodePipeline.VideoEncoderRef,
     io: std.Io,
 ) !RenderSummary {
-    const width: u32 = if (opts.width > 0) @intCast(opts.width) else 7680;
-    const height: u32 = if (opts.height > 0) @intCast(opts.height) else 4320;
-    const channels = if (opts.channels == 1 or opts.channels == 3) opts.channels else @as(u32, 1);
-
     // ── Scan manifests ──────────────────────────────────────────────
     const manifest_paths = scanManifests(allocator, opts.manifest_dir, io) catch {
         cli.err("cannot open manifests dir: {s}", .{opts.manifest_dir});
@@ -987,6 +983,50 @@ pub fn render(
     }
 
     cli.info("manifests: {d} frames", .{manifest_paths.len});
+
+    // ── Auto-detect source dimensions from first manifest header ─────
+    // Manifest binary format: first 8 bytes are src_w (u32 LE) + src_h (u32 LE).
+    var src_w: u32 = 0;
+    var src_h: u32 = 0;
+    {
+        const header_data = std.Io.Dir.cwd().readFileAlloc(io, manifest_paths[0], allocator, .limited(8)) catch null;
+        if (header_data) |data| {
+            defer allocator.free(data);
+            if (data.len >= 8) {
+                src_w = std.mem.readInt(u32, data[0..4], .little);
+                src_h = std.mem.readInt(u32, data[4..8], .little);
+            }
+        }
+    }
+
+    // Compute output dimensions preserving source aspect ratio.
+    // If neither width nor height is specified, use source dimensions directly.
+    // If only one is specified, compute the other from the source aspect ratio.
+    // Falls back to 7680×4320 if source dimensions are unavailable.
+    var width: u32 = 0;
+    var height: u32 = 0;
+    if (opts.width > 0 and opts.height > 0) {
+        width = @intCast(opts.width);
+        height = @intCast(opts.height);
+    } else if (opts.width > 0 and opts.height <= 0) {
+        if (src_w > 0 and src_h > 0) {
+            height = @intFromFloat(@as(f64, @floatFromInt(opts.width)) * @as(f64, @floatFromInt(src_h)) / @as(f64, @floatFromInt(src_w)) + 0.5);
+        } else height = 4320;
+    } else if (opts.width <= 0 and opts.height > 0) {
+        if (src_w > 0 and src_h > 0) {
+            width = @intFromFloat(@as(f64, @floatFromInt(opts.height)) * @as(f64, @floatFromInt(src_w)) / @as(f64, @floatFromInt(src_h)) + 0.5);
+        } else width = 7680;
+    } else {
+        if (src_w > 0 and src_h > 0) {
+            width = src_w;
+            height = src_h;
+        } else {
+            width = 7680;
+            height = 4320;
+        }
+    }
+
+    const channels = if (opts.channels == 1 or opts.channels == 3) opts.channels else @as(u32, 1);
 
     // ── Auto-detect fps from sidecar ────────────────────────────────
     var fps = opts.fps;

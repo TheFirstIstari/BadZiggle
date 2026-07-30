@@ -241,7 +241,6 @@ pub fn loadRegistry(allocator: std.mem.Allocator, path: []const u8, io: std.Io) 
 
 /// CLI options
 pub const Options = struct {
-    input: []const u8 = "",
     output: []const u8 = "",
     video: []const u8 = "",
     features: []const u8 = "",
@@ -256,7 +255,9 @@ pub const Options = struct {
     bits: u32 = 1,
     no_edges: bool = false,
     color: bool = false,
+    multi_scale: bool = false,
     scales: []const u32 = &.{},
     channels: u32 = 1,
     verbose: bool = false,
+    fps: f64 = 0.0,
 };

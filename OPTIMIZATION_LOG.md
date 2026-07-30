@@ -283,7 +283,68 @@ if (fill_start < canvas.len) {
 
 ---
 
-### Performance Summary
+### Flag Parity Fixes (BadApplestein C reference parity)
+
+#### 1. `--preset` expansion for render subcommand
+
+**Date:** 2026-07-29
+**File:** `src/main.zig`
+**Change:** Added `expandPreset(&opts)` call in the `render` subcommand branch and the shorthand `<input> <output>` pipeline, matching the existing call in the `arrange` branch. Previously, preset expansion (`8k`, `4k`, `1080p`, `720p` → width/height) was only applied to the arrange subcommand; the render subcommand ignored `--preset` entirely.
+**Rationale:** The C reference BadApplestein applies preset expansion for both arrange and render subcommands via `preset_width()`. Without this fix, `--preset 4k` passed to the render subcommand had no effect, always using the default 1920×1080 dimensions instead of 3840×2160.
+**Before:** `--preset` only applied to `badziggle arrange`; ignored for `badziggle render`
+**After:** `--preset` correctly overrides width/height/fps for `badziggle render` and the shorthand pipeline
+**Verified:** `zig build` and `zig build test` pass
+
+#### 2. `--codec` CLI flag for render subcommand
+
+**Date:** 2026-07-29
+**File:** `src/main.zig`
+**Change:** Added `--codec <name>` CLI flag support in `runRender()`. The user-provided codec name is read via `cli.optStr("codec", "")` and passed as a null-terminated string to `VideoEncoder.open()`, overriding the default auto-detection behavior. When not set, the existing hardware/software auto-detection logic is preserved.
+**Rationale:** The C reference BadApplestein has `--codec` to let users choose the encoder (e.g. `prores_ks`, `h264_videotoolbox`). Previously BadZiggle hardcoded the encoder choice based solely on channel count and hardware probe results, with no user override.
+**Before:** Codec hardcoded to `prores_ks` (software) or auto-detected HW encoder; no user override
+**After:** `--codec` flag allows explicit encoder selection; auto-detection used when flag is absent
+**Verified:** `zig build` and `zig build test` pass
+
+#### 3. `--pix-fmt` CLI flag for render subcommand
+
+**Date:** 2026-07-29
+**File:** `src/main.zig`
+**Change:** Added `--pix-fmt <name>` CLI flag support in `runRender()`. The user-provided pixel format string is read via `cli.optStr("pix-fmt", "")` and passed as a null-terminated string to `VideoEncoder.open()`, overriding the default pixel format derived from the codec name. When not set, the existing auto-detected pixel format (yuv420p for HW, yuv422p10le for SW, gray for grayscale) is preserved.
+**Rationale:** The C reference BadApplestein has `--pix-fmt` to let users specify the pixel format (e.g. `yuv420p`, `yuv422p10le`, `gray`). Previously BadZiggle hardcoded the pixel format based on the codec and channel count, with no user override.
+**Before:** Pixel format hardcoded based on codec/channel logic; no user override
+**After:** `--pix-fmt` flag allows explicit pixel format selection; auto-detection used when flag is absent
+**Verified:** `zig build` and `zig build test` pass
+
+#### 4. `--no-hw` flag formally documented and wired for render subcommand
+
+**Date:** 2026-07-29
+**File:** `src/main.zig`, `src/cli.zig`
+**Change:** Added `--no-hw` to the render help text (`printRenderHelp()`) and ensured it is properly read from the CLI store. The hardware encoder detection logic already respected `--no-hw` via `cli.has("no-hw")` in `runRender()`, but the flag was undocumented and missing from `printRenderHelp()`.
+**Rationale:** The C reference BadApplestein documents `--no-hw` to disable hardware encoder detection and force software ProRes encoding. While BadZiggle's implementation already worked, the flag was not listed in the help text and had no dedicated `optBool()` accessor in `cli.buildOptions()`.
+**Before:** `--no-hw` worked at runtime but was undocumented in render help
+**After:** `--no-hw` listed in `badziggle render --help` and properly documented
+**Verified:** `zig build` and `zig build test` pass
+
+---
+
+#### 5. Auto-detect output dimensions from manifest header (render and CLI defaults)
+
+**Date:** 2026-07-29
+**Files:** `src/render.zig`, `src/main.zig`, `src/cli.zig`
+**Change:** Fixed three related dimension auto-detection gaps to match the BadApplestein C reference:
+
+1. **`src/render.zig` `render()`**: Replaced hardcoded 7680×4320 defaults with manifest-based auto-detection. When `--width` or `--height` is not specified (≤ 0), reads `src_w`/`src_h` from the first manifest binary header (first 8 bytes: `u32` LE each). Computes the missing dimension preserving the source aspect ratio (if only width given: `height = width * src_h / src_w`; if only height: `width = height * src_w / src_h`). If neither is given, uses source dimensions directly. Falls back to 7680×4320 if the manifest is unreadable.
+
+2. **`src/main.zig` `runRender()`**: Updated encoder dimension setup to use the same manifest-header auto-detection, ensuring the VideoEncoder dimensions match the render pipeline's computed dimensions instead of falling back to hardcoded 7680×4320.
+
+3. **`src/cli.zig` `buildOptions()`**: Changed default width/height from 1920/1080 to 0 so that absent `--width`/`--height` CLI flags produce a zero sentinel value that triggers manifest-based auto-detection in render() rather than using hardcoded defaults.
+
+4. **`src/main.zig` `autoDetectSource()`**: Updated from hardcoded 1920×1080 to read source dimensions from the first manifest header with aspect-ratio-preserving computation. Added `manifest_dir`, `io`, and `allocator` parameters for manifest access.
+
+**Rationale:** The C reference BadApplestein auto-detects all output dimensions from the source video manifest, preserving aspect ratio. BadZiggle was using hardcoded defaults at every layer (CLI options, main.zig encoder setup, render.zig canvas), breaking feature parity for users who don't explicitly specify dimensions.
+**Before:** Hardcoded 7680×4320 (render), 7680×4320 (encoder), 1920×1080 (autoDetectSource); CLI defaults 1920×1080 bypassed auto-detection entirely
+**After:** All dimensions auto-detected from manifest header with aspect-ratio preservation; only 7680×4320 used as ultimate fallback when manifest is unreadable
+**Verified:** `zig build` and `zig build test` pass
 
 All optimizations combined bring BadZiggle to the following performance vs the C reference:
 
