@@ -10,9 +10,11 @@ pub fn build(b: *std.Build) void {
     const release_small = b.option(bool, "release-small", "Compile with ReleaseSmall optimization") orelse false;
 
     const optimize = blk: {
+        if (b.option(bool, "release-safe", "Compile with ReleaseSafe optimization") orelse false) break :blk std.builtin.OptimizeMode.ReleaseSafe;
         if (release_fast) break :blk std.builtin.OptimizeMode.ReleaseFast;
         if (release_small) break :blk std.builtin.OptimizeMode.ReleaseSmall;
-        break :blk b.standardOptimizeOption(.{});
+        // Default to ReleaseFast instead of Debug (fixes performance trap)
+        break :blk std.builtin.OptimizeMode.ReleaseFast;
     };
 
     const strip = b.option(bool, "strip", "Strip debug symbols from release builds") orelse false;
